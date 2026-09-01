@@ -1,5 +1,20 @@
 # OpenNovaDash
 
+基于 [uv](https://docs.astral.sh/uv/) 管理的 Python 项目，用于通过 Wi-Fi CGI 协议控制联咏（Novatek）方案的行车记录仪。
+
+## 快速开始
+
+```bash
+# 安装依赖（自动创建 .venv 并使用 uv 管理的 Python 3.13）
+uv sync
+
+# 运行控制脚本（需先连接记录仪 Wi-Fi，网关 192.168.1.254）
+uv run script.py
+```
+
+新增依赖：`uv add <package>`，移除依赖：`uv remove <package>`。
+
+---
 
 联咏（Novatek）官方的 SDK 和芯片手册受 NDA 保密协议约束，官方不对外公开完整文档。但通过开源社区多年对 SJCAM、GoXtreme、Viofo 等基于联咏主控设备的逆向工程，其核心通信协议与系统架构已被完全整理出来。
 

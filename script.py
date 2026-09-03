@@ -1,24 +1,27 @@
 """联咏 (Novatek) 行车记录仪 CGI 控制与诊断脚本.
 
-v4 变更 (基于 860N72-SF20200714 固件三轮实测):
-1. 3015 文件列表: 本机固件直接返回文件树 XML(无 Status 字段包裹),
-   改为按 <FPATH> 是否存在判定成功, 不再依赖 Status.
-2. 2001 是状态机敏感命令: 只在"录像中"能停(str=0)、只在"空闲"能开(str=1),
-   重复发同状态命令返回 -22. 录像控制改为状态感知流程, 且收尾确保设备
-   回到录像状态(本机切回视频模式不会自动恢复循环录像, 必须显式 str=1).
-3. 修复 XML 元素 truthiness 误判 (Element 无子节点时 bool 为 False).
-4. 2017 抓拍挪到"确认录像中"之后复测(空闲状态下测得的 -22 不能下结论).
+v5 变更 (基于 860N72-SF20200714 固件四轮实测):
+1. 实测 3015 完全可用: 直接返回文件树(无 Status), 照片在 A:\\CARDV\\PHOTO\\*.JPG,
+   循环录像在 A:\\CARDV\\MOVIE\\*.TS; 早期测试拍的照片已确认落卡.
+2. 卡写满(剩 0.21GB/344个TS)是该设备的当前根因: 1001 拍照 -5(EIO 写卡失败),
+   2001 开始/停止录像 -22 或长时间阻塞并拖死 HTTP.
+   新增显式确认的格式化入口: uv run script.py --format-sd
+3. 2001 无参数查询返回 -21: 本机不支持查询变体, 录像状态只能靠命令反馈推断.
+4. 失联恢复等待加长到 60s (实测卡满时设备可阻塞 30s 以上).
+
+v4 变更:
+1. 3015 按 <FPATH> 判定成功, 不依赖 Status.
+2. 2001 状态机敏感: str=0 只在录像中有效, str=1 只在空闲时有效, 重复同状态 -22;
+   录像控制改为状态感知流程, 收尾确保回到录像状态(本机切模式不自动恢复循环录像).
+3. 修复 XML 元素 truthiness 误判; 2017 挪到"确认录像中"后复测.
 
 v3 变更:
-1. 已确认本机 2001 录像控制用 str= 传参 (只发 par= 会返回 -22).
-2. 实测 "停止录像" 秒回, 但 "恢复录像" 会让固件的单线程 HTTP 服务器长时间
-   无响应, 期间一切 CGI (含心跳) 超时/连接重置. 应对:
-   - 所有请求串行化: 心跳只在空闲时非阻塞抢锁, 有命令在处理就让路;
-   - 重命令 (录像/切模式) 用长超时 + 连接错误自动重试 + 命令后留稳定等待;
-   - 录像控制测试挪到最后, 避免拖垮前面的测试;
-   - wait_device_back(): 设备失联时轮询心跳直至恢复.
+1. 本机 2001 录像控制用 str= 传参 (par= 返回 -22).
+2. 单线程 HTTP 服务器: 所有请求(含心跳)经锁串行; 重命令长超时+自动重试;
+   录像控制放最后避免拖垮前面测试; wait_device_back() 轮询恢复.
 """
 
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -34,7 +37,9 @@ HEARTBEAT_INTERVAL = 3.0  # readme: 必须每 3~5 秒心跳一次
 ERROR_HINTS = {
     -1: "不支持/被拒绝",
     -3: "存储或状态错误: 录像中查文件列表、SD 卡未就绪时常见",
+    -5: "EIO 写卡失败: 卡满或卡故障, 备份后格式化 (本机实测卡满时 1001 拍照返回此码)",
     -13: "抓拍执行失败 (exec fail)",
+    -21: "本机实测于 2001 无参数查询: 查询变体大概率不支持",
     -22: "EINVAL 参数无效: 固件不认这个参数名/参数值, 或当前状态不允许",
 }
 
@@ -297,13 +302,38 @@ def test_record_control():
     # 收尾: 行车记录仪必须回到循环录像状态(本机切视频模式不会自动恢复)
     send_cmd(2001, str_par=1, description="恢复录像 (str=1, 确保记录仪回到工作状态)", timeout=15)
     time.sleep(3)
-    wait_device_back(30, "等待恢复录像后 HTTP 恢复")
+    wait_device_back(60, "等待恢复录像后 HTTP 恢复 (卡满时设备可阻塞较久)")
     send_cmd(2001, description="最终确认录像状态 (预期 Value=1 录像中)")
 
 
+def format_sd():
+    """显式确认后才执行的 SD 卡格式化 (uv run script.py --format-sd)."""
+    print("=" * 40)
+    print(" ⚠️  SD 卡格式化 (cmd=3010&str=1)")
+    print("=" * 40)
+    print("卡上全部文件 (循环录像/照片/锁定片段) 将被永久删除!")
+    print("如未备份, 请先通过文件列表确认并下载需要保留的文件.")
+    answer = input("确认已备份并继续格式化? 输入 yes 执行: ").strip().lower()
+    if answer != "yes":
+        print("已取消, 未做任何改动.")
+        return
+    root = send_cmd(3010, str_par=1, description="格式化 SD 卡", timeout=30)
+    if is_ok(root):
+        print("  → 已发出格式化指令, 设备需要时间重建文件系统")
+        wait_device_back(60, "等待格式化完成")
+        send_cmd(3017, description="格式化后查询剩余空间 (应接近卡总容量)")
+
+
 if __name__ == "__main__":
-    print("=== 联咏 Novatek 行车记录仪控制指令测试 (v3) ===")
+    if "--format-sd" in sys.argv:
+        threading.Thread(target=heartbeat_loop, daemon=True).start()
+        format_sd()
+        heartbeat_stop.set()
+        raise SystemExit(0)
+
+    print("=== 联咏 Novatek 行车记录仪控制指令测试 (v5) ===")
     print("说明: Status<0 为错误码(即 Linux errno), 括号内为常见含义;")
+    print("      卡满时 1001/2001 异常属预期, 先格式化 (uv run script.py --format-sd)")
 
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
@@ -314,5 +344,6 @@ if __name__ == "__main__":
 
     heartbeat_stop.set()
     print("\n=== 测试结束 ===")
-    print("提示: 若第 4 步中途失联, 查看设备屏幕确认录像是否已恢复;")
-    print("      行车记录仪重启或按实体录像键也可恢复循环录像.")
+    print("提示: 若第 4 步中途失联, 设备大概率已卡死, 断电重启即可恢复;")
+    print("      卡满(剩0.2GB)是当前 1001/-5 与 2001 异常的根因, 备份后运行:")
+    print("      uv run script.py --format-sd")

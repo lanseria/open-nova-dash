@@ -29,9 +29,9 @@
 
 **4. SD 卡文件管理与下载模块 (Media Explorer)**
 
-* **文件树拉取**：发送 `cmd=3015` 获取 SD 卡文件列表，解析 XML 生成按日期排序的视频/照片列表。
-* **缩略图预览**：拼接路径 `[http://192.168.1.254/A:/Movie/xxx.MP4?custom=1&cmd=4001](http://192.168.1.254/A:/Movie/xxx.MP4?custom=1&cmd=4001)` 异步加载缩略图。
-* **高速下载**：通过 HTTP 异步拉取 `.MP4` 原片（使用主码流的高清画质），下载完成后调用 `PHPhotoLibrary` 自动保存到 iPhone 系统相册。
+* **文件树拉取**：发送 `cmd=3015` 获取 SD 卡文件列表（本机实测直接返回文件树 XML，无 Status 包裹，按 `<FPATH>` 解析）。实测目录结构：照片 `A:\CARDV\PHOTO\*.JPG`、循环录像 `A:\CARDV\MOVIE\*.TS`，文件名内嵌拍摄时间戳（如 `20260901194216_000002.JPG`），按目录分组即得"循环视频/照片"两个 tab。
+* **缩略图预览**：拼接路径 `http://192.168.1.254/A:/CARDV/MOVIE/xxx.TS?custom=1&cmd=4001` 异步加载缩略图（`4001` 待实测）。
+* **高速下载与保存**：通过 HTTP 异步拉取原片。⚠️ 循环录像为 **TS 格式**，iOS `PHPhotoLibrary` 不能直接导入：需先用 `FFmpegKit` 无转码重封装（remux）为 MP4 再存入系统相册；在线播放则 `MobileVLCKit`/`KSPlayer` 均支持直接播 TS 流。
 
 ---
 

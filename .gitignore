@@ -9,3 +9,10 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
+
+# Xcode / iOS
+ios/build/
+xcuserdata/
+*.xcuserdatad/
+DerivedData/
+.DS_Store

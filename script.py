@@ -1,11 +1,19 @@
 """联咏 (Novatek) 行车记录仪 CGI 控制与诊断脚本.
 
-v3 变更 (基于 860N72-SF20200714 固件两轮实测):
+v4 变更 (基于 860N72-SF20200714 固件三轮实测):
+1. 3015 文件列表: 本机固件直接返回文件树 XML(无 Status 字段包裹),
+   改为按 <FPATH> 是否存在判定成功, 不再依赖 Status.
+2. 2001 是状态机敏感命令: 只在"录像中"能停(str=0)、只在"空闲"能开(str=1),
+   重复发同状态命令返回 -22. 录像控制改为状态感知流程, 且收尾确保设备
+   回到录像状态(本机切回视频模式不会自动恢复循环录像, 必须显式 str=1).
+3. 修复 XML 元素 truthiness 误判 (Element 无子节点时 bool 为 False).
+4. 2017 抓拍挪到"确认录像中"之后复测(空闲状态下测得的 -22 不能下结论).
+
+v3 变更:
 1. 已确认本机 2001 录像控制用 str= 传参 (只发 par= 会返回 -22).
 2. 实测 "停止录像" 秒回, 但 "恢复录像" 会让固件的单线程 HTTP 服务器长时间
    无响应, 期间一切 CGI (含心跳) 超时/连接重置. 应对:
-   - 所有请求串行化: 心跳只在空闲时非阻塞抢锁, 有命令在处理就让路,
-     杜绝对单线程服务器并发打请求;
+   - 所有请求串行化: 心跳只在空闲时非阻塞抢锁, 有命令在处理就让路;
    - 重命令 (录像/切模式) 用长超时 + 连接错误自动重试 + 命令后留稳定等待;
    - 录像控制测试挪到最后, 避免拖垮前面的测试;
    - wait_device_back(): 设备失联时轮询心跳直至恢复.
@@ -92,6 +100,20 @@ def is_ok(root):
     return root is not None and root.findtext("Status") == "0"
 
 
+def extract_fpath(root):
+    """从响应中取第一个 <FPATH> (拍照成功时返回照片保存路径)."""
+    if root is None:
+        return None
+    return next((e.text.strip() for e in root.iter("FPATH") if e.text and e.text.strip()), None)
+
+
+def parse_file_list(root):
+    """解析 3015 响应为路径列表; 本机固件直接返回文件树, 无 Status 包裹."""
+    if root is None:
+        return None
+    return [e.text.strip() for e in root.iter("FPATH") if e.text and e.text.strip()] or None
+
+
 def send_cmd(cmd, par=None, str_par=None, description="", timeout=4):
     """发送 CGI 指令并解析 XML 响应, 返回 XML 根节点(失败返回 None)."""
     param_desc = (
@@ -141,10 +163,9 @@ def wait_device_back(max_wait=30, description="等待设备恢复响应"):
     return None
 
 
-def print_file_list(root, max_items=15):
-    paths = [e.text.strip() for e in root.iter("FPATH") if e.text and e.text.strip()]
+def print_file_list(paths, max_items=15):
     if not paths:
-        print("  (文件列表为空或本固件的列表结构不同, 可检查上面的原始字段)")
+        print("  (文件列表为空或本固件的列表结构不同)")
         return
     photos = [p for p in paths if p.upper().endswith((".JPG", ".JPEG"))]
     videos = [p for p in paths if p.upper().endswith((".MP4", ".MOV", ".TS"))]
@@ -187,75 +208,97 @@ def test_file_list():
     print(" 第 2 步: 文件列表测试 (cmd=3015)")
     print("=" * 40)
 
-    root = send_cmd(3015, description="直接查询文件列表 (录像中预期被拒, 作对照)", timeout=12)
-    if is_ok(root):
-        print_file_list(root)
+    # 本机固件的 3015 直接返回文件树 XML(无 Status 包裹), 以 FPATH 判定成败
+    root = send_cmd(3015, description="直接查询文件列表", timeout=12)
+    paths = parse_file_list(root)
+    if paths:
+        print("  → 成功: 本机 3015 直接返回文件树")
+        print_file_list(paths)
         return
 
-    print("  → 改走联咏 APP 相册标准流程: 先切回放模式 -> 查列表 -> 切回视频模式")
+    print("  → 响应无 FPATH, 改走联咏 APP 相册标准流程: 先切回放模式再查")
     send_cmd(3001, par=2, description="切换到回放模式 (par=2)", timeout=12)
     time.sleep(2)
 
     root = send_cmd(3015, description="回放模式下查询文件列表", timeout=12)
-    if is_ok(root):
-        print_file_list(root)
+    paths = parse_file_list(root)
+    if paths:
+        print_file_list(paths)
     else:
-        print("  ⚠️ 回放模式下仍失败, 请结合第 1 步 SD 卡状态排查")
+        print("  ⚠️ 回放模式下也无文件, 请结合第 1 步 SD 卡状态排查")
 
-    send_cmd(3001, par=0, description="切回视频模式 (固件将自动恢复循环录像)", timeout=12)
+    send_cmd(3001, par=0, description="切回视频模式", timeout=12)
     time.sleep(3)
-    wait_device_back(20, "切回视频模式后设备要恢复循环录像, 等待 HTTP 恢复")
 
 
 def test_capture():
     print("\n" + "=" * 40)
-    print(" 第 3 步: 拍照测试")
+    print(" 第 3 步: 拍照测试 (cmd=1001)")
     print("=" * 40)
 
-    # 方式 A: 2017 = 录像中抓拍快照 (GitUp Git2 实测用法; 失败时固件返回 -13)
-    root = send_cmd(2017, description="方式 A: 录像中抓拍快照 (cmd=2017)", timeout=6)
-    if is_ok(root):
-        print("  → 支持 2017 抓拍, 无需打断录像")
-    else:
-        print("  → 2017 不可用 (或当前未在录像), 改用模式切换法")
-    time.sleep(1)
+    # 方式 A: 直接 1001 (v1 时代实测本机在录像中发 1001 也返回过成功;
+    # 上轮照片模式下返回 -5 = errno EIO, 疑似卡快满写卡失败, 格式化后应复测)
+    root = send_cmd(1001, description="方式 A: 直接拍照 (cmd=1001)", timeout=6)
+    fpath = extract_fpath(root)
+    if is_ok(root) or fpath:
+        if fpath:
+            print(f"  📷 照片已保存: {fpath}")
+        print("  → 直接拍照可用, 无需切换模式")
+        return
 
-    # 方式 B: 切照片模式 -> 1001 拍照 -> 切回视频模式
+    print("  → 直接拍照失败, 改用模式切换法")
     print("\n--- 方式 B: 切换模式拍照 ---")
     send_cmd(3001, par=1, description="切换到照片模式 (par=1)", timeout=12)
     time.sleep(2)
 
     root = send_cmd(1001, description="执行拍照 (cmd=1001)", timeout=6)
-    fpath = next((e.text.strip() for e in root.iter("FPATH") if e.text), None) if root else None
+    fpath = extract_fpath(root)
     if fpath:
         print(f"  📷 照片已保存: {fpath}")
     else:
-        print("  ⚠️ 响应中无 <FPATH>, 拍照是否生效需在第 2 步文件列表中确认")
+        status = root.findtext("Status") if root is not None else None
+        hint = "(-5 = EIO 写卡失败, 卡快满时常见, 建议格式化后复测)" if status == "-5" else ""
+        print(f"  ⚠️ 拍照未确认 {hint}")
     time.sleep(1.5)
 
     send_cmd(3001, par=0, description="切回视频模式", timeout=12)
     time.sleep(3)
-    wait_device_back(20, "等待设备恢复循环录像后的 HTTP 恢复")
 
 
 def test_record_control():
     print("\n" + "=" * 40)
-    print(" 第 4 步: 录像控制测试 (cmd=2001, 放最后:")
-    print(" 实测恢复录像会让设备长时间无响应, 避免拖垮前面测试)")
+    print(" 第 4 步: 录像控制测试 (cmd=2001, 放最后避免拖垮前面测试)")
+    print(" 本机实测: str=0 只在录像中有效, str=1 只在空闲时有效,")
+    print(" 重复发同状态命令返回 -22")
     print("=" * 40)
 
-    root = send_cmd(2001, str_par=0, description="停止录像 (str=0, 本机已验证 str 有效)", timeout=12)
-    if not is_ok(root):
-        print("  → 停止失败, 跳过本步剩余测试")
-        return
-    time.sleep(2)
-    send_cmd(2001, description="查询录像状态 (预期 Value=0 已停; 部分固件支持)")
+    # 先确保进入录像状态 (-22 视为"已在录像中")
+    root = send_cmd(2001, str_par=1, description="开始录像 (str=1; -22=已在录像中)", timeout=15)
+    if is_ok(root):
+        print("  → 已发出开始录像指令, 等待设备稳定...")
+        time.sleep(3)
+    elif root is None:
+        # 单线程服务器阻塞时读会超时, 但命令可能已被执行, 不能凭超时判定失败
+        wait_device_back(30, "等待设备恢复响应")
+    send_cmd(2001, description="查询录像状态 (2001 无参数; 部分固件支持)")
 
-    send_cmd(2001, str_par=1, description="恢复录像 (str=1, 实测设备会忙一阵, 长超时)", timeout=15)
-    # 单线程服务器阻塞时读会超时, 但命令可能已被设备执行, 不能凭超时判定失败
+    # 此刻应处于录像中: 复测 2017 抓拍 (此前在空闲状态下测得 -22, 不能下结论)
+    root = send_cmd(2017, description="录像中复测抓拍 (cmd=2017)", timeout=6)
+    if is_ok(root):
+        print("  → 2017 录像中抓拍可用! APP 抓拍可免切模式")
+    else:
+        print("  → 2017 不可用, APP 抓拍走 1001 直接拍或模式切换法")
+    time.sleep(1)
+
+    send_cmd(2001, str_par=0, description="停止录像 (str=0; -22=本就不在录像)", timeout=12)
+    time.sleep(2)
+    send_cmd(2001, description="查询录像状态 (预期 Value=0 已停)")
+
+    # 收尾: 行车记录仪必须回到循环录像状态(本机切视频模式不会自动恢复)
+    send_cmd(2001, str_par=1, description="恢复录像 (str=1, 确保记录仪回到工作状态)", timeout=15)
     time.sleep(3)
-    if wait_device_back(30, "等待恢复录像后 HTTP 恢复响应") is not None:
-        send_cmd(2001, description="再次查询录像状态 (预期 Value=1 录像中)")
+    wait_device_back(30, "等待恢复录像后 HTTP 恢复")
+    send_cmd(2001, description="最终确认录像状态 (预期 Value=1 录像中)")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,16 @@
 """联咏 (Novatek) 行车记录仪 CGI 控制与诊断脚本.
 
+v6 变更 (针对 "Max retries exceeded" 请求堆积问题):
+1. 重试策略修正: 只重试"连接建立失败"(请求未送达, 安全); 读超时一律不自动
+   重发 -- v5 的 read=1 重试会把 2001 这类状态命令重复发给阻塞中的单线程
+   服务器, 请求堆积且可能重复执行 (即日志中 Max retries exceeded 的来源).
+2. 心跳自适应退避: 连续失败后降频到 15s, 不再以 3s 节奏敲阻塞中的设备,
+   恢复成功后自动回到正常节奏.
+3. 录像控制流程改为"超时先等恢复再补发": 中间无意义的 2001 无参查询移除
+   (两轮实测 -21, 本机不支持); 恢复响应后补发的 str=1 是安全操作
+   (若已在录像只会返回 -22, 无副作用).
+4. wait_device_back 探测间隔放宽到 3s, 减少对阻塞设备的请求密度.
+
 v5 变更 (基于 860N72-SF20200714 固件四轮实测):
 1. 实测 3015 完全可用: 直接返回文件树(无 Status), 照片在 A:\\CARDV\\PHOTO\\*.JPG,
    循环录像在 A:\\CARDV\\MOVIE\\*.TS; 早期测试拍的照片已确认落卡.
@@ -32,6 +43,7 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "http://192.168.1.254"
 HEARTBEAT_INTERVAL = 3.0  # readme: 必须每 3~5 秒心跳一次
+HEARTBEAT_BACKOFF_INTERVAL = 15.0  # 设备无响应时的心跳退避间隔
 
 # 负数 Status 与 Linux errno 编号一致, 以下是实测/社区文档中出现过的:
 ERROR_HINTS = {
@@ -48,15 +60,16 @@ ERROR_HINTS = {
 CMD_LOCK = threading.Lock()
 
 session = requests.Session()
-# 单连接池 + 对连接级错误自动重试: 规避 keep-alive 连接被设备
-# 单方面关闭后复用报 RemoteDisconnected 的问题 (GET 幂等, 重试安全).
+# 单连接池; 仅重试"连接建立失败"(TCP 未建成、请求未送达, 重试安全).
+# 读超时一律不自动重发 (read=0): 2001/3001/1001 这类状态命令重复执行有风险,
+# 且设备阻塞时重发只会让请求堆积 (v5 实测的 Max retries exceeded 即来源于此).
 session.mount(
     "http://",
     HTTPAdapter(
         pool_connections=1,
         pool_maxsize=1,
         max_retries=Retry(
-            total=2, connect=2, read=1, backoff_factor=0.8,
+            total=1, connect=1, read=0, backoff_factor=0.3,
             allowed_methods=frozenset(["GET"]),
         ),
     ),
@@ -66,13 +79,16 @@ heartbeat_stop = threading.Event()
 
 
 def heartbeat_loop():
-    while not heartbeat_stop.wait(HEARTBEAT_INTERVAL):
+    fail_streak = 0
+    while not heartbeat_stop.wait(HEARTBEAT_INTERVAL if fail_streak < 2 else HEARTBEAT_BACKOFF_INTERVAL):
         if not CMD_LOCK.acquire(blocking=False):
             continue  # 有命令正在处理, 本轮心跳让路, 等下一周期
         try:
             session.get(BASE_URL + "/", params={"custom": 1, "cmd": 3016}, timeout=2)
+            fail_streak = 0
         except requests.RequestException:
-            pass
+            # 连续失败说明设备阻塞/失联, 退避降频, 别拿请求砸单线程服务器
+            fail_streak += 1
         finally:
             CMD_LOCK.release()
 
@@ -132,6 +148,8 @@ def send_cmd(cmd, par=None, str_par=None, description="", timeout=4):
             root = raw_cmd(cmd, par, str_par, timeout)
     except requests.RequestException as e:
         print(f"  └─ 请求异常: {type(e).__name__}: {e}")
+        if "Read timed out" in str(e) or "ReadTimeoutError" in str(e):
+            print("      (读超时=设备阻塞处理中; 已配置为不自动重发, 避免状态命令重复执行)")
         return None
     except ET.ParseError:
         print(f"  └─ 非标准 XML 响应")
@@ -161,7 +179,7 @@ def wait_device_back(max_wait=30, description="等待设备恢复响应"):
             print(f"  ✅ 设备已恢复响应 (耗时约 {time.time() - start:.0f}s)")
             return root
         except (requests.RequestException, ET.ParseError):
-            time.sleep(2)
+            time.sleep(3)
         finally:
             CMD_LOCK.release()
     print("  ❌ 仍未恢复: 设备可能还在忙, 稍等后重跑脚本, 或查看设备屏幕状态")
@@ -274,20 +292,19 @@ def test_record_control():
     print("\n" + "=" * 40)
     print(" 第 4 步: 录像控制测试 (cmd=2001, 放最后避免拖垮前面测试)")
     print(" 本机实测: str=0 只在录像中有效, str=1 只在空闲时有效,")
-    print(" 重复发同状态命令返回 -22")
+    print(" 重复同状态命令返回 -22; 2001 无参查询两轮实测 -21(不支持)已移除")
     print("=" * 40)
 
-    # 先确保进入录像状态 (-22 视为"已在录像中")
+    # 1. 开始录像 (-22 = 已在录像中)
     root = send_cmd(2001, str_par=1, description="开始录像 (str=1; -22=已在录像中)", timeout=15)
     if is_ok(root):
         print("  → 已发出开始录像指令, 等待设备稳定...")
         time.sleep(3)
     elif root is None:
-        # 单线程服务器阻塞时读会超时, 但命令可能已被执行, 不能凭超时判定失败
-        wait_device_back(30, "等待设备恢复响应")
-    send_cmd(2001, description="查询录像状态 (2001 无参数; 部分固件支持)")
+        # 读超时无法判定命令是否已被执行, 不重发; 先等设备恢复再继续
+        wait_device_back(60, "设备无响应 (不重发命令, 避免重复执行)")
 
-    # 此刻应处于录像中: 复测 2017 抓拍 (此前在空闲状态下测得 -22, 不能下结论)
+    # 2. 此刻应处于录像中: 复测 2017 抓拍 (空闲状态下测得的 -22 不能下结论)
     root = send_cmd(2017, description="录像中复测抓拍 (cmd=2017)", timeout=6)
     if is_ok(root):
         print("  → 2017 录像中抓拍可用! APP 抓拍可免切模式")
@@ -295,15 +312,21 @@ def test_record_control():
         print("  → 2017 不可用, APP 抓拍走 1001 直接拍或模式切换法")
     time.sleep(1)
 
-    send_cmd(2001, str_par=0, description="停止录像 (str=0; -22=本就不在录像)", timeout=12)
-    time.sleep(2)
-    send_cmd(2001, description="查询录像状态 (预期 Value=0 已停)")
+    # 3. 停止录像
+    root = send_cmd(2001, str_par=0, description="停止录像 (str=0; -22=本就不在录像)", timeout=12)
+    if is_ok(root):
+        time.sleep(2)
+    elif root is None:
+        wait_device_back(60, "停止录像后设备无响应, 等待恢复 (不重发)")
 
-    # 收尾: 行车记录仪必须回到循环录像状态(本机切视频模式不会自动恢复)
-    send_cmd(2001, str_par=1, description="恢复录像 (str=1, 确保记录仪回到工作状态)", timeout=15)
+    # 4. 收尾: 行车记录仪必须回到循环录像状态(本机切视频模式不会自动恢复)
+    root = send_cmd(2001, str_par=1, description="恢复录像 (str=1, 确保记录仪回到工作状态)", timeout=15)
+    if root is None:
+        # 恢复响应后补发一次是安全的: 若已在录像只会返回 -22, 无副作用
+        if wait_device_back(60, "设备无响应, 等待恢复") is not None:
+            send_cmd(2001, str_par=1, description="补发恢复录像 (str=1; -22=已在录像, 无副作用)", timeout=15)
     time.sleep(3)
-    wait_device_back(60, "等待恢复录像后 HTTP 恢复 (卡满时设备可阻塞较久)")
-    send_cmd(2001, description="最终确认录像状态 (预期 Value=1 录像中)")
+    send_cmd(3017, description="收尾: 查询剩余空间 (设备存活确认, 兼看循环录像写卡)")
 
 
 def format_sd():
@@ -331,7 +354,7 @@ if __name__ == "__main__":
         heartbeat_stop.set()
         raise SystemExit(0)
 
-    print("=== 联咏 Novatek 行车记录仪控制指令测试 (v5) ===")
+    print("=== 联咏 Novatek 行车记录仪控制指令测试 (v6) ===")
     print("说明: Status<0 为错误码(即 Linux errno), 括号内为常见含义;")
     print("      卡满时 1001/2001 异常属预期, 先格式化 (uv run script.py --format-sd)")
 

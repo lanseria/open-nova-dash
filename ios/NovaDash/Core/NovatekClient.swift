@@ -5,7 +5,8 @@ import Foundation
 /// 架构红线(来自 script.py 五轮实测, 详见仓库 readme "坑位说明"):
 /// - HTTP 服务器单线程 → 一切请求经 AsyncSemaphore 串行, 心跳忙时让路;
 /// - 读超时不重发状态命令(可能重复执行, 实测曾引发请求风暴);
-/// - 心跳连续失败后退避(3s → 15s), 恢复后自动回到正常节奏;
+/// - 连接保活由 ConnectionModel 驱动: 手动连接后按 3s 节奏 ping,
+///   连续失败判定断开并回到待连接页面;
 /// - 重命令(录像/切模式)用长超时; "超时 ≠ 命令失败", 由 UI 提示稍后确认;
 /// - 2001 状态机敏感: 重复开始/停止返回 -22;
 /// - 下载 URL 规则: 去掉路径的 "A:" 盘符前缀 (hfs 服务器实测).
@@ -15,14 +16,6 @@ actor NovatekClient {
     let baseURL = URL(string: "http://192.168.1.254")!
     private let session: URLSession
     private let gate = AsyncSemaphore(value: 1)
-
-    /// 协议要求 3~5 秒心跳一次, 否则设备主动断开 Wi-Fi
-    private let heartbeatInterval: TimeInterval = 3
-    /// 连续失败后的退避间隔 (设备阻塞时不再以 3s 节奏敲门)
-    private let heartbeatBackoff: TimeInterval = 15
-
-    private(set) var lastHeartbeatAt: Date?
-    private var heartbeatTask: Task<Void, Never>?
 
     init() {
         let config = URLSessionConfiguration.default
@@ -96,41 +89,17 @@ actor NovatekClient {
         return reply.response
     }
 
-    // MARK: - 心跳
+    // MARK: - 连接探测
 
-    func startHeartbeat() {
-        heartbeatTask?.cancel()
-        lastHeartbeatAt = nil
-        heartbeatTask = Task { [weak self] in
-            var failures = 0
-            while !Task.isCancelled {
-                // actor 的 let 属性(Sendable)可同步读取; 连续失败后退避
-                let interval = failures >= 2 ? (self?.heartbeatBackoff ?? 15) : (self?.heartbeatInterval ?? 3)
-                try? await Task.sleep(for: .seconds(interval))
-                guard !Task.isCancelled, let self else { return }
-                if await self.pingOnce() {
-                    failures = 0
-                } else {
-                    failures += 1
-                }
-            }
-        }
-    }
-
-    func stopHeartbeat() {
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
-    }
-
-    private func pingOnce() async -> Bool {
-        // 有命令正在处理时让路; 设备显然活着, 视为心跳正常
+    /// 单次存活探测 (cmd 3016). 有命令占用串行通道时直接视为存活, 不打扰设备。
+    /// 是否断开、何时停止请求, 由 ConnectionModel 决策。
+    func ping() async -> Bool {
         guard gate.tryWait() else { return true }
         defer { gate.signal() }
         do {
             var request = try makeRequest(cmd: 3016)
             request.timeoutInterval = 3
             _ = try await session.data(for: request)
-            lastHeartbeatAt = Date()
             return true
         } catch {
             return false

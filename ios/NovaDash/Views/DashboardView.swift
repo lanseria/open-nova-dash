@@ -10,21 +10,19 @@ final class DashboardModel {
     func refresh() async {
         isLoading = true
         errorText = nil
-        let client = NovatekClient.shared
-        await client.startHeartbeat()
-        status = await client.fetchDeviceStatus()
-        // 四项查询全部拿不到数据 → 基本可判定未连上记录仪
+        status = await NovatekClient.shared.fetchDeviceStatus()
+        // 四项查询全部拿不到数据 → 设备可能正忙或已断开
         if status.firmware == "未知", status.battery == nil,
            status.sdCard == nil, status.freeBytes == nil {
-            errorText = "无法连接记录仪: 请确认 iPhone 已连接记录仪 Wi-Fi (网关 192.168.1.254), 并在系统弹窗中允许本地网络访问"
+            errorText = "设备无响应: 可能正忙, 请稍后下拉刷新; 若心跳已断开将自动返回待连接页面"
         }
         isLoading = false
     }
 }
 
 struct DashboardView: View {
+    @Environment(ConnectionModel.self) private var connection
     @State private var model = DashboardModel()
-    @State private var heartbeatAt: Date?
 
     var body: some View {
         NavigationStack {
@@ -51,19 +49,25 @@ struct DashboardView: View {
                         Image(systemName: "wifi")
                         Text("心跳")
                         Spacer()
-                        if let heartbeatAt {
+                        if let heartbeatAt = connection.lastHeartbeatAt {
                             Label("正常", systemImage: "checkmark.circle.fill")
                                 .foregroundStyle(.green)
                             Text(heartbeatAt.formatted(date: .omitted, time: .standard))
                                 .foregroundStyle(.secondary)
                         } else {
-                            Text("未启动").foregroundStyle(.secondary)
+                            Text("等待响应").foregroundStyle(.secondary)
                         }
                     }
+                    Button(role: .destructive) {
+                        connection.disconnect()
+                    } label: {
+                        Label("断开连接", systemImage: "wifi.slash")
+                    }
+                    .disabled(model.isLoading)
                 } header: {
                     Text("连接")
                 } footer: {
-                    Text("记录仪要求每 3~5 秒心跳一次, 否则主动断开 Wi-Fi; 设备忙时心跳自动让路并退避。")
+                    Text("每 3 秒心跳一次保持连接; 连续失败将自动返回待连接页面。设备忙时心跳自动让路。")
                 }
 
                 if let error = model.errorText {
@@ -76,13 +80,6 @@ struct DashboardView: View {
             .navigationTitle("NovaDash")
             .refreshable { await model.refresh() }
             .task { await model.refresh() }
-            .task {
-                // 心跳指示器每 3 秒刷新一次
-                while !Task.isCancelled {
-                    heartbeatAt = await NovatekClient.shared.lastHeartbeatAt
-                    try? await Task.sleep(for: .seconds(3))
-                }
-            }
             .overlay {
                 if model.isLoading {
                     ProgressView("正在查询…")

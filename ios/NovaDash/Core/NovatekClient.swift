@@ -190,29 +190,112 @@ actor NovatekClient {
 
     // MARK: - 下载
 
-    /// 下载文件到 App 文档目录, 返回本地 URL. progress 在后台线程回调 (0...1).
+    /// 下载文件到 App 文档目录 (导出用), 返回本地 URL. progress 在后台线程回调 (0...1).
     /// 下载期间持有串行通道, 心跳自动让路.
     func download(
         _ file: DashcamFile,
         progress: @Sendable @escaping (Double) -> Void
     ) async throws -> URL {
-        await gate.wait()
-        defer { gate.signal() }
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let destination = directory.appendingPathComponent(file.name)
+        try await streamToFile(file, to: destination, progress: progress)
+        return destination
+    }
 
-        // hfs 文件服务器 (Connection: close, 不复用连接): 逐段编码路径
+    /// 预览缓存目录 (预览播放/生成封面共用; 系统可自动清理)
+    private var previewDirectory: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let dir = caches.appendingPathComponent("NovaDashPreview", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// 完整下载到缓存目录 (点击卡片预览用); 已缓存则直接复用.
+    func fetchPreviewFile(
+        _ file: DashcamFile,
+        progress: @Sendable @escaping (Double) -> Void = { _ in }
+    ) async throws -> URL {
+        let destination = previewDirectory.appendingPathComponent(file.name)
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path),
+           let size = attrs[.size] as? Int64, size > 0 {
+            progress(1)
+            return destination
+        }
+        try await streamToFile(file, to: destination, progress: progress)
+        return destination
+    }
+
+    /// 已缓存的完整预览文件 (有则返回地址, 不触发下载); 供封面兜底抽帧用
+    func cachedPreviewURL(for file: DashcamFile) -> URL? {
+        let destination = previewDirectory.appendingPathComponent(file.name)
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path),
+           let size = attrs[.size] as? Int64, size > 0 {
+            return destination
+        }
+        return nil
+    }
+
+    /// 只取文件头部 maxBytes 字节后提前断开 (视频封面用, 无论服务器是否支持 Range).
+    func fetchHead(_ file: DashcamFile, maxBytes: Int) async throws -> URL {
+        let destination = previewDirectory.appendingPathComponent("head_" + file.name)
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path),
+           let size = attrs[.size] as? Int64, size > 0 {
+            return destination
+        }
+        // 低优先级排队: 不挡住状态页/控制命令, 但仍与它们互斥串行
+        await gate.wait(priority: .low)
+        defer { gate.signal() }
+        let (bytes, response) = try await session.bytes(from: remoteURL(of: file))
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw NovatekError.badResponse("下载失败 HTTP \(code)")
+        }
+        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: destination)
+        defer { try? handle.close() }
+
+        var received = 0
+        var buffer = Data()
+        buffer.reserveCapacity(64 * 1024)
+        for try await byte in bytes {
+            buffer.append(byte)
+            received += 1
+            if buffer.count >= 64 * 1024 {
+                try handle.write(contentsOf: buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+            if received >= maxBytes { break }   // 提前断开, 剩余数据由连接关闭丢弃
+        }
+        if !buffer.isEmpty {
+            try handle.write(contentsOf: buffer)
+        }
+        return destination
+    }
+
+    /// 设备上文件的 HTTP 地址 (hfs 文件服务器)
+    private func remoteURL(of file: DashcamFile) -> URL {
         var url = baseURL
         for segment in file.downloadPath.split(separator: "/") {
             url.appendPathComponent(String(segment))
         }
+        return url
+    }
 
-        let (bytes, response) = try await session.bytes(from: url)
+    /// 逐段落盘 (hfs 服务器 Connection: close, 不复用连接), 期间持有串行通道.
+    /// 低优先级: 批量下载不挡住高优先级的状态查询与控制命令.
+    private func streamToFile(
+        _ file: DashcamFile,
+        to destination: URL,
+        progress: @Sendable @escaping (Double) -> Void
+    ) async throws {
+        await gate.wait(priority: .low)
+        defer { gate.signal() }
+        let (bytes, response) = try await session.bytes(from: remoteURL(of: file))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw NovatekError.badResponse("下载失败 HTTP \(code)")
         }
 
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let destination = directory.appendingPathComponent(file.name)
         FileManager.default.createFile(atPath: destination.path, contents: nil)
         let handle = try FileHandle(forWritingTo: destination)
         defer { try? handle.close() }
@@ -234,6 +317,5 @@ actor NovatekClient {
             try handle.write(contentsOf: buffer)
         }
         progress(1)
-        return destination
     }
 }

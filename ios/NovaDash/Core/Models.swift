@@ -82,4 +82,63 @@ struct DashcamFile: Identifiable, Sendable {
         if upper.hasSuffix(".TS") || upper.hasSuffix(".MP4") || upper.hasSuffix(".MOV") { return .video }
         return .other
     }
+
+    /// 不带扩展名的文件名 (找 .THM 伴生文件用)
+    var baseName: String {
+        guard let idx = name.lastIndex(of: ".") else { return name }
+        return String(name[..<idx])
+    }
+
+    /// 生成时间: 从文件名解析 (如 20260901_000002 → 2026-09-01 00:00:02); 解析失败为 nil
+    var timestamp: Date? { Self.parseTimestamp(name) }
+
+    /// 所在日期的零点 (按天分组用)
+    var day: Date? { timestamp.map { Calendar.current.startOfDay(for: $0) } }
+
+    var timeText: String {
+        timestamp.map { Self.timeFormatter.string(from: $0) } ?? "--:--:--"
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    private static func parseTimestamp(_ text: String) -> Date? {
+        guard let match = text.firstMatch(of: /(\d{8})\D?(\d{6})/) else { return nil }
+        let ds = String(match.1), ts = String(match.2)
+        var comps = DateComponents()
+        comps.year = Int(ds.prefix(4))
+        comps.month = Int(ds.dropFirst(4).prefix(2))
+        comps.day = Int(ds.dropFirst(6).prefix(2))
+        comps.hour = Int(ts.prefix(2))
+        comps.minute = Int(ts.dropFirst(2).prefix(2))
+        comps.second = Int(ts.dropFirst(4).prefix(2))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.date(from: comps)
+    }
+}
+
+/// 相册按"天"分组的卡片区块
+struct FileGroup: Identifiable, Sendable {
+    let day: Date?
+    let files: [DashcamFile]
+
+    var id: String { day.map { "\($0.timeIntervalSince1970)" } ?? "unknown" }
+
+    var title: String {
+        guard let day else { return "未知日期" }
+        if Calendar.current.isDateInToday(day) { return "今天" }
+        if Calendar.current.isDateInYesterday(day) { return "昨天" }
+        return Self.dayFormatter.string(from: day)
+    }
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy年M月d日"
+        f.locale = Locale(identifier: "zh_CN")
+        return f
+    }()
 }

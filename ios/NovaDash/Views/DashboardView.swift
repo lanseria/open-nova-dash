@@ -8,15 +8,42 @@ final class DashboardModel {
     var errorText: String?
 
     func refresh() async {
+        // 防重入: 切换标签页会重复触发 .task, 不再叠加排队
+        guard !isLoading else { return }
         isLoading = true
         errorText = nil
-        status = await NovatekClient.shared.fetchDeviceStatus()
-        // 四项查询全部拿不到数据 → 设备可能正忙或已断开
-        if status.firmware == "未知", status.battery == nil,
-           status.sdCard == nil, status.freeBytes == nil {
-            errorText = "设备无响应: 可能正忙, 请稍后下拉刷新; 若心跳已断开将自动返回待连接页面"
+        // 总超时兜底: 设备被大文件下载占住时, 查询可能长时间排队, 不让"正在查询"永远挂着
+        if let status = await withTimeout(seconds: 20, operation: {
+            await NovatekClient.shared.fetchDeviceStatus()
+        }) {
+            self.status = status
+            // 四项查询全部拿不到数据 → 设备可能正忙或已断开
+            if status.firmware == "未知", status.battery == nil,
+               status.sdCard == nil, status.freeBytes == nil {
+                errorText = "设备无响应: 可能正忙, 请稍后下拉刷新; 若心跳已断开将自动返回待连接页面"
+            }
+        } else {
+            errorText = "查询超时: 设备正忙 (可能在大文件下载/录像), 请稍后下拉刷新"
         }
         isLoading = false
+    }
+}
+
+/// 给不可取消的串行队列查询加超时; 超时返回 nil (原任务会在后台自然结束)
+@MainActor
+private func withTimeout<T: Sendable>(
+    seconds: TimeInterval,
+    operation: @escaping @Sendable () async -> T
+) async -> T? {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask { await operation() }
+        group.addTask {
+            try? await Task.sleep(for: .seconds(seconds))
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
     }
 }
 

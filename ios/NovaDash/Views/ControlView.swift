@@ -45,10 +45,14 @@ final class ControlModel {
 
 struct ControlView: View {
     @State private var model = ControlModel()
+    @State private var stream = RTSPStreamModel()
+    @AppStorage("rtspURL") private var rtspURL = "rtsp://192.168.1.254/stream0"
 
     var body: some View {
         NavigationStack {
             List {
+                liveSection
+
                 Section {
                     Button {
                         Task { await model.capture() }
@@ -103,6 +107,96 @@ struct ControlView: View {
                 }
             }
             .navigationTitle("控制")
+            .onDisappear { stream.stop() }
         }
     }
+
+    // MARK: - RTSP 实时流
+
+    @ViewBuilder
+    private var liveSection: some View {
+        Section {
+            switch stream.phase {
+            case .streaming:
+                RTSPSurface(model: stream)
+                    .aspectRatio(16 / 9, contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .listRowInsets(EdgeInsets())
+                    .background(Color.black)
+                LabeledContent("帧数", value: "\(stream.frameCount)")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Button(role: .destructive) {
+                    stream.stop()
+                } label: {
+                    Label("停止直播", systemImage: "stop.fill")
+                }
+
+            case .connecting:
+                HStack {
+                    ProgressView()
+                    Text("正在连接 \(rtspURL) …")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button(role: .destructive) {
+                    stream.stop()
+                } label: {
+                    Label("取消", systemImage: "xmark.circle")
+                }
+
+            case .failed(let message):
+                TextField("RTSP 地址", text: $rtspURL)
+                    .keyboardType(.URL)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .font(.footnote)
+                Menu {
+                    ForEach(Self.presets, id: \.self) { preset in
+                        Button(preset) { rtspURL = preset }
+                    }
+                } label: {
+                    Label("常用地址", systemImage: "list.bullet")
+                }
+                Button {
+                    stream.start(urlString: rtspURL)
+                } label: {
+                    Label("重新连接", systemImage: "play.rectangle.fill")
+                }
+                .disabled(rtspURL.isEmpty)
+
+            case .idle:
+                TextField("RTSP 地址", text: $rtspURL)
+                    .keyboardType(.URL)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                Menu {
+                    ForEach(Self.presets, id: \.self) { preset in
+                        Button(preset) { rtspURL = preset }
+                    }
+                } label: {
+                    Label("常用地址", systemImage: "list.bullet")
+                }
+                Button {
+                    stream.start(urlString: rtspURL)
+                } label: {
+                    Label("开始直播", systemImage: "play.rectangle.fill")
+                }
+                .disabled(rtspURL.isEmpty)
+            }
+        } header: {
+            Text("实时视频流 (RTSP)")
+        } footer: {
+            Text("通过 RTSP/TCP 拉流并在本机硬解 (H.264)。不同固件的流地址不同, 可在「常用地址」里切换; 直播时设备较忙, 文件下载请稍后再试。离开本页自动断开。")
+        }
+    }
+
+    private static let presets = [
+        "rtsp://192.168.1.254/stream0",
+        "rtsp://192.168.1.254/ch00_0.h264",
+        "rtsp://192.168.1.254/live/ch00_0",
+        "rtsp://192.168.1.254/h264",
+    ]
 }

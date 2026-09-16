@@ -304,6 +304,21 @@ actor NovatekClient {
         remoteURL(of: file)
     }
 
+    /// HEAD 请求获取文件大小; 服务器不支持或失败返回 nil
+    func fetchFileSize(for file: DashcamFile) async -> Int64? {
+        await gate.wait()
+        defer { gate.signal() }
+        var request = URLRequest(url: remoteURL(of: file))
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 5
+        guard let (_, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse,
+              http.statusCode == 200, http.expectedContentLength >= 0 else {
+            return nil
+        }
+        return http.expectedContentLength
+    }
+
     /// 逐段落盘 (hfs 服务器 Connection: close, 不复用连接), 期间持有串行通道.
     /// 低优先级: 批量下载不挡住高优先级的状态查询与控制命令.
     private func streamToFile(

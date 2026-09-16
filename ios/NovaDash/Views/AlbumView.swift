@@ -26,6 +26,8 @@ final class AlbumModel {
     var downloads: [String: DownloadState] = [:]
     /// 卡片封面 (id → 缩略图/视频封面)
     var thumbs: [String: UIImage] = [:]
+    /// 已尝试但拿不到封面的文件 (显示静态占位, 不再重复请求)
+    var failedThumbs: Set<String> = []
 
     /// 按天分组, 新的在前; 时间无法解析的归入"未知日期"排最后
     var groups: [FileGroup] {
@@ -99,7 +101,7 @@ final class AlbumModel {
     }
 
     func loadThumb(for file: DashcamFile) async {
-        guard thumbs[file.id] == nil else { return }
+        guard thumbs[file.id] == nil, !failedThumbs.contains(file.id) else { return }
         // 视频优先找设备端同名 .THM 缩略图
         let thm = files.first {
             $0.kind == .other
@@ -108,6 +110,8 @@ final class AlbumModel {
         }
         if let image = await ThumbnailStore.shared.thumbnail(for: file, thm: thm) {
             thumbs[file.id] = image
+        } else {
+            failedThumbs.insert(file.id)
         }
     }
 }
@@ -154,11 +158,14 @@ struct AlbumView: View {
             .overlay(alignment: .bottom) {
                 toast
             }
-            .fullScreenCover(item: $viewerGroup) { group in
+            .sheet(item: $viewerGroup) { group in
                 PhotoViewer(model: model, photos: group.files)
+                    .presentationDragIndicator(.visible)
+                    .presentationBackground(.black)
             }
             .sheet(item: $streamingFile) { file in
                 VideoStreamSheet(file: file)
+                    .presentationDragIndicator(.visible)
             }
         }
     }
@@ -222,7 +229,7 @@ struct AlbumView: View {
         .task { await model.loadThumb(for: file) }
     }
 
-    /// 16:9 封面图, 未加载完成时显示占位
+    /// 16:9 封面图: 加载中流光占位 → 失败静态图标 → 成功显示封面
     private func cover(_ file: DashcamFile) -> some View {
         Color.clear
             .aspectRatio(16 / 9, contentMode: .fit)
@@ -231,17 +238,15 @@ struct AlbumView: View {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
-                } else {
+                } else if model.failedThumbs.contains(file.id) {
                     ZStack {
                         Rectangle().fill(.quaternary)
-                        if file.kind == .video {
-                            Image(systemName: "video")
-                                .font(.title2)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ProgressView()
-                        }
+                        Image(systemName: file.kind == .video ? "video" : "photo")
+                            .font(.title2)
+                            .foregroundStyle(.tertiary)
                     }
+                } else {
+                    ShimmerCover(iconName: file.kind == .video ? "video" : "photo")
                 }
             }
             .clipShape(.rect(topLeadingRadius: 12, topTrailingRadius: 12))
@@ -313,7 +318,69 @@ struct AlbumView: View {
     }
 }
 
-// MARK: - 照片全屏查看器 (同一天内翻页)
+// MARK: - 封面加载占位 (流光扫过动画)
+
+private struct ShimmerCover: View {
+    let iconName: String
+    @State private var phase: CGFloat = -1
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.quaternary)
+            Image(systemName: iconName)
+                .font(.title2)
+                .foregroundStyle(.tertiary)
+            GeometryReader { geo in
+                LinearGradient(
+                    colors: [.clear, .white.opacity(0.35), .clear],
+                    startPoint: .leading, endPoint: .trailing
+                )
+                .frame(width: geo.size.width * 0.6)
+                .offset(x: phase * geo.size.width * 1.6)
+            }
+        }
+        .clipped()
+        .task {
+            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                phase = 1
+            }
+        }
+    }
+}
+
+// MARK: - 文件信息栏 (照片/视频预览共用)
+
+struct FileInfoView: View {
+    let file: DashcamFile
+    let sizeText: String?
+    /// 深色背景 (照片全屏查看) 时用白色文字
+    var dark = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(file.name)
+                .font(.footnote.weight(.semibold))
+                .lineLimit(1)
+            HStack(spacing: 10) {
+                Label(file.timestampText, systemImage: "clock")
+                Label(file.kind == .photo ? "照片" : "视频",
+                      systemImage: file.kind == .photo ? "photo" : "video")
+                if let sizeText {
+                    Label(sizeText, systemImage: "internaldrive")
+                }
+            }
+            .font(.caption2)
+            Text(file.rawPath)
+                .font(.caption2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .foregroundStyle(dark ? .white.opacity(0.85) : .secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - 照片查看器 (同一天内翻页, 下拉收起)
 
 private struct PhotoViewer: View {
     let model: AlbumModel
@@ -322,6 +389,7 @@ private struct PhotoViewer: View {
     @State private var index = 0
     @State private var images: [String: UIImage] = [:]
     @State private var urls: [String: URL] = [:]
+    @State private var sizes: [String: Int64] = [:]
     @State private var scale: CGFloat = 1
     @Environment(\.dismiss) private var dismiss
 
@@ -335,6 +403,11 @@ private struct PhotoViewer: View {
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .background(Color.black.ignoresSafeArea())
+            .overlay(alignment: .bottom) {
+                FileInfoView(file: photos[index], sizeText: sizeText, dark: true)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
+            }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -350,6 +423,12 @@ private struct PhotoViewer: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private var sizeText: String? {
+        sizes[photos[index].id].map {
+            ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+        }
     }
 
     private func page(_ file: DashcamFile) -> some View {
@@ -378,6 +457,9 @@ private struct PhotoViewer: View {
     }
 
     private func loadFull(_ file: DashcamFile) async {
+        if sizes[file.id] == nil {
+            sizes[file.id] = await NovatekClient.shared.fetchFileSize(for: file)
+        }
         guard images[file.id] == nil else { return }
         guard let url = try? await NovatekClient.shared.fetchPreviewFile(file),
               let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
@@ -419,37 +501,33 @@ private struct PhotoViewer: View {
     }
 }
 
-// MARK: - 视频在线播放 (KSPlayer/FFmpeg 直接拉设备 TS 流)
+// MARK: - 视频在线播放 (KSPlayer/FFmpeg 直接拉设备 TS 流, 带播控)
 
 private struct VideoStreamSheet: View {
     let file: DashcamFile
 
     @StateObject private var coordinator = KSVideoPlayer.Coordinator()
+    @State private var isLoading = true
+    @State private var isPlaying = true
+    @State private var isSeeking = false
+    @State private var currentTime: TimeInterval = 0
+    @State private var totalTime: TimeInterval = 0
     @State private var errorText: String?
+    @State private var fileSize: Int64?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                KSVideoPlayer(
-                    coordinator: coordinator,
-                    url: NovatekClient.shared.streamURL(for: file),
-                    options: makeOptions()
+            VStack(spacing: 12) {
+                player
+                controls
+                FileInfoView(
+                    file: file,
+                    sizeText: fileSize.map {
+                        ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+                    }
                 )
-                .aspectRatio(16 / 9, contentMode: .fit)
-                .background(Color.black)
-
-                if let errorText {
-                    Label(errorText, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .padding(.horizontal)
-                } else {
-                    Text("FFmpeg 实时拉流播放; 需要离线保存时用卡片上的 ↓ 按钮下载")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal)
-                }
+                .padding(.horizontal, 16)
                 Spacer()
             }
             .frame(maxWidth: .infinity)
@@ -461,8 +539,111 @@ private struct VideoStreamSheet: View {
                     Button("关闭") { dismiss() }
                 }
             }
-            .onAppear { bindCallbacks() }
+            .onAppear {
+                bindCallbacks()
+                Task {
+                    fileSize = await NovatekClient.shared.fetchFileSize(for: file)
+                }
+            }
             .onDisappear { coordinator.resetPlayer() }
+        }
+    }
+
+    // MARK: 播放器 + 加载/错误浮层
+
+    private var player: some View {
+        ZStack {
+            KSVideoPlayer(
+                coordinator: coordinator,
+                url: NovatekClient.shared.streamURL(for: file),
+                options: makeOptions()
+            )
+            .aspectRatio(16 / 9, contentMode: .fit)
+            .background(Color.black)
+
+            if isLoading {
+                ZStack {
+                    Color.black.opacity(0.4)
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .tint(.white)
+                        Text("正在加载视频流…")
+                            .font(.footnote)
+                            .foregroundStyle(.white)
+                    }
+                }
+            }
+            if let errorText {
+                ZStack {
+                    Color.black.opacity(0.6)
+                    Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .padding()
+                }
+            }
+        }
+    }
+
+    // MARK: 播控条 (播放/暂停 + 进度条 + 静音)
+
+    private var controls: some View {
+        HStack(spacing: 12) {
+            Button {
+                togglePlay()
+            } label: {
+                Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.title2)
+            }
+            .disabled(isLoading || errorText != nil)
+
+            if totalTime > 0 {
+                Text(timeString(currentTime))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Slider(
+                    value: Binding(
+                        get: { min(currentTime / max(totalTime, 1), 1) },
+                        set: { currentTime = $0 * totalTime }
+                    ),
+                    onEditingChanged: { editing in
+                        isSeeking = editing
+                        if !editing {
+                            coordinator.seek(time: currentTime)
+                            Task {
+                                try? await Task.sleep(for: .seconds(0.6))
+                                isSeeking = false
+                            }
+                        }
+                    }
+                )
+                Text(timeString(totalTime))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("缓冲中, 时长未知…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                coordinator.isMuted.toggle()
+            } label: {
+                Image(systemName: coordinator.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.title3)
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private func togglePlay() {
+        guard let player = coordinator.playerLayer?.player else { return }
+        if player.playbackState == .playing {
+            player.pause()
+            isPlaying = false
+        } else {
+            player.play()
+            isPlaying = true
         }
     }
 
@@ -473,19 +654,54 @@ private struct VideoStreamSheet: View {
     }
 
     private func bindCallbacks() {
-        coordinator.onFinish = { _, error in
+        coordinator.onPlay = { [weak coordinator] current, total in
             Task { @MainActor in
-                if let error {
-                    errorText = "播放失败: \(error.localizedDescription)"
-                }
+                guard coordinator != nil, !isSeeking else { return }
+                currentTime = current
+                if total > 0 { totalTime = total }
             }
         }
         coordinator.onStateChanged = { _, state in
             Task { @MainActor in
-                if state == .bufferFinished || state == .readyToPlay {
+                switch state {
+                case .initialized, .preparing, .buffering:
+                    isLoading = true
+                case .readyToPlay, .bufferFinished:
+                    isLoading = false
+                    isPlaying = true
                     errorText = nil
+                case .paused:
+                    isLoading = false
+                    isPlaying = false
+                case .playedToTheEnd:
+                    isLoading = false
+                    isPlaying = false
+                case .error:
+                    isLoading = false
+                    isPlaying = false
+                    errorText = errorText ?? "播放失败, 请稍后重试"
+                default:
+                    break
                 }
             }
         }
+        coordinator.onFinish = { _, error in
+            Task { @MainActor in
+                if let error {
+                    isLoading = false
+                    errorText = "播放失败: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func timeString(_ interval: TimeInterval) -> String {
+        let total = max(Int(interval), 0)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, seconds)
+            : String(format: "%02d:%02d", minutes, seconds)
     }
 }

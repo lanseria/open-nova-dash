@@ -99,6 +99,17 @@ struct DashcamFile: Identifiable, Sendable {
         timestamp.map { Self.timeFormatter.string(from: $0) } ?? "--:--:--"
     }
 
+    /// 预览信息栏用: 完整日期时间
+    var timestampText: String {
+        timestamp.map { Self.fullFormatter.string(from: $0) } ?? "时间未知"
+    }
+
+    private static let fullFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"

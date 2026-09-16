@@ -133,15 +133,32 @@ struct ControlView: View {
                     .frame(maxWidth: .infinity)
                     .listRowInsets(EdgeInsets())
                     .background(Color.black)
+                    .overlay {
+                        if isLiveLoading {
+                            ZStack {
+                                Color.black.opacity(0.4)
+                                VStack(spacing: 8) {
+                                    ProgressView().tint(.white)
+                                    Text(liveStatus ?? "连接中…")
+                                        .font(.footnote)
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                        }
+                        if let liveError {
+                            ZStack {
+                                Color.black.opacity(0.5)
+                                Label(liveError, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.footnote)
+                                    .foregroundStyle(.red)
+                                    .padding()
+                            }
+                        }
+                    }
                 if let liveStatus {
                     LabeledContent("状态", value: liveStatus)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                }
-                if let liveError {
-                    Label(liveError, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(.red)
                 }
                 Button(role: .destructive) {
                     stopLive()
@@ -171,6 +188,10 @@ struct ControlView: View {
         } footer: {
             Text("readme 实测节点: 主码流 novatek/main (高清), 子码流 novatek/sub (低延迟, 预览推荐)。HTTP-FLV (8080/live) 暂未适配。直播时设备较忙, 文件下载请稍后再试。离开本页自动断开。")
         }
+    }
+
+    private var isLiveLoading: Bool {
+        liveStatus == "连接中…" || liveStatus == "缓冲中…"
     }
 
     private var addressMenu: some View {

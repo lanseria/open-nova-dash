@@ -166,6 +166,7 @@ struct AlbumView: View {
             .sheet(item: $streamingFile) { file in
                 VideoStreamSheet(file: file)
                     .presentationDragIndicator(.visible)
+                    .presentationBackground(.black)
             }
         }
     }
@@ -518,20 +519,26 @@ private struct VideoStreamSheet: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 12) {
-                player
-                controls
+            // 与照片查看器同构: 媒体区垂直居中, 文件信息固定在底部
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                VStack(spacing: 10) {
+                    player
+                    controls
+                }
+                Spacer(minLength: 0)
                 FileInfoView(
                     file: file,
                     sizeText: fileSize.map {
                         ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
-                    }
+                    },
+                    dark: true
                 )
                 .padding(.horizontal, 16)
-                Spacer()
+                .padding(.bottom, 12)
             }
-            .frame(maxWidth: .infinity)
-            .background(Color(.systemBackground))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black.ignoresSafeArea())
             .navigationTitle(file.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -547,45 +554,52 @@ private struct VideoStreamSheet: View {
             }
             .onDisappear { coordinator.resetPlayer() }
         }
+        .preferredColorScheme(.dark)
     }
 
     // MARK: 播放器 + 加载/错误浮层
 
     private var player: some View {
-        ZStack {
-            KSVideoPlayer(
-                coordinator: coordinator,
-                url: NovatekClient.shared.streamURL(for: file),
-                options: makeOptions()
-            )
+        // 播放器是 UIViewRepresentable, 没有稳定的理想尺寸, 直接 .aspectRatio 会在
+        // 加载中/播放中两个状态算出不同高度导致跳变;
+        // 用固定 16:9 的黑色底座撑住尺寸, 播放器只做叠加填充, 前后完全同框
+        Color.black
             .aspectRatio(16 / 9, contentMode: .fit)
-            .background(Color.black)
-
-            if isLoading {
-                ZStack {
-                    Color.black.opacity(0.4)
-                    VStack(spacing: 10) {
-                        ProgressView()
-                            .tint(.white)
-                        Text("正在加载视频流…")
-                            .font(.footnote)
-                            .foregroundStyle(.white)
+            .overlay {
+                KSVideoPlayer(
+                    coordinator: coordinator,
+                    url: NovatekClient.shared.streamURL(for: file),
+                    options: makeOptions()
+                )
+            }
+            .overlay {
+                if isLoading {
+                    ZStack {
+                        Color.black.opacity(0.4)
+                        VStack(spacing: 10) {
+                            ProgressView()
+                                .tint(.white)
+                            Text("正在加载视频流…")
+                                .font(.footnote)
+                                .foregroundStyle(.white)
+                        }
                     }
                 }
             }
-            if let errorText {
-                ZStack {
-                    Color.black.opacity(0.6)
-                    Label(errorText, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .padding()
+            .overlay {
+                if let errorText {
+                    ZStack {
+                        Color.black.opacity(0.6)
+                        Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .padding()
+                    }
                 }
             }
-        }
     }
 
-    // MARK: 播控条 (播放/暂停 + 进度条 + 静音)
+    // MARK: 播控条 (播放/暂停 + 进度条 + 静音); 固定高度, 时长未知也不塌缩
 
     private var controls: some View {
         HStack(spacing: 12) {
@@ -597,34 +611,33 @@ private struct VideoStreamSheet: View {
             }
             .disabled(isLoading || errorText != nil)
 
-            if totalTime > 0 {
-                Text(timeString(currentTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Slider(
-                    value: Binding(
-                        get: { min(currentTime / max(totalTime, 1), 1) },
-                        set: { currentTime = $0 * totalTime }
-                    ),
-                    onEditingChanged: { editing in
-                        isSeeking = editing
-                        if !editing {
-                            coordinator.seek(time: currentTime)
-                            Task {
-                                try? await Task.sleep(for: .seconds(0.6))
-                                isSeeking = false
-                            }
+            Text(timeString(currentTime))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.7))
+
+            Slider(
+                value: Binding(
+                    get: { totalTime > 0 ? min(currentTime / max(totalTime, 1), 1) : 0 },
+                    set: { currentTime = $0 * totalTime }
+                ),
+                onEditingChanged: { editing in
+                    guard totalTime > 0 else { return }
+                    isSeeking = editing
+                    if !editing {
+                        coordinator.seek(time: currentTime)
+                        Task {
+                            try? await Task.sleep(for: .seconds(0.6))
+                            isSeeking = false
                         }
                     }
-                )
-                Text(timeString(totalTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("缓冲中, 时长未知…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+                }
+            )
+            .disabled(totalTime <= 0)
+            .tint(.white)
+
+            Text(totalTime > 0 ? timeString(totalTime) : "--:--")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.7))
 
             Button {
                 coordinator.isMuted.toggle()
@@ -633,7 +646,9 @@ private struct VideoStreamSheet: View {
                     .font(.title3)
             }
         }
+        .tint(.white)
         .padding(.horizontal, 16)
+        .frame(height: 36)
     }
 
     private func togglePlay() {

@@ -1,95 +1,115 @@
 # OpenNovaDash
 
-基于 [uv](https://docs.astral.sh/uv/) 管理的 Python 项目，用于通过 Wi-Fi CGI 协议控制联咏（Novatek）方案的行车记录仪。
+开源的联咏（Novatek）方案行车记录仪 Wi-Fi 伴侣：通过记录仪自带的 Wi-Fi 热点（网关 `192.168.1.254`）发送 CGI 指令，实现**实时画面、相册管理、拍照录像控制**，无需厂商 App。
+
+包含两个组件：
+
+| 组件 | 路径 | 说明 |
+| --- | --- | --- |
+| Python 控制脚本 | `script.py` | 终端里直接诊断设备、列文件、拍照、控制录像、格式化 SD 卡 |
+| iOS 客户端 (NovaDash) | `ios/` | SwiftUI 编写的完整 App：状态仪表盘 + 相册 + 控制台 + RTSP 直播 |
+
+理论上适用于所有联咏方案的行车记录仪/运动相机（SJCAM、GoXtreme、Viofo 等），不同厂商固件对协议的支持有差异。已在一台 **860N72（固件 SF20200714）** 上完整实测。
+
+## 功能特性
+
+**iOS 客户端 (NovaDash)**
+
+- **连接管理**：手动点击连接才开始探测，3 秒心跳保活（`cmd=3016`），断开自动回到待连接页
+- **状态仪表盘**：固件版本、电池、SD 卡状态、剩余空间、心跳时间
+- **相册**：按天分组的封面卡片，FFmpeg 流式抽帧生成封面（含磁盘缓存），点击即在线播放 TS 视频（KSPlayer/FFmpeg 拉流，无需先下载），支持下载导出到系统相册
+- **控制台**：拍照（含录像中安全抓拍连招）、录像开关、RTSP 实时直播（`novatek/main` 主码流 / `novatek/sub` 子码流）
+
+**Python 脚本**（子命令与 iOS 页面一一对应）
+
+- `connect` 连接探测 + 心跳保活演示
+- `status` 状态仪表盘（固件版本/电池/SD 卡/剩余空间）
+- `album` 文件列表，`--download 关键字` 按文件名子串下载到 `./downloads/`
+- `control` 拍照（安全连招）/ 录像开关 / RTSP 节点 / SD 卡格式化（二次确认）
+- 内置串行锁 + 心跳退避，规避记录仪 HTTP 服务的并发红线
 
 ## 快速开始
 
-```bash
-# 安装依赖（自动创建 .venv 并使用 uv 管理的 Python 3.13）
-uv sync
+### 前置条件
 
-# 运行控制脚本（需先连接记录仪 Wi-Fi，网关 192.168.1.254）
-uv run script.py
+手机（或电脑）先连接记录仪的 Wi-Fi 热点，记录仪网关地址为 `192.168.1.254`。
+
+### Python 脚本
+
+依赖 [uv](https://docs.astral.sh/uv/) 管理（自动创建 .venv 并使用 Python 3.13）：
+
+```bash
+uv sync                    # 安装依赖
+uv run script.py --help    # 查看子命令（与 iOS 页面一一对应）
+uv run script.py status    # 例：状态仪表盘
 ```
 
 新增依赖：`uv add <package>`，移除依赖：`uv remove <package>`。
 
----
+### iOS 客户端
 
-联咏（Novatek）官方的 SDK 和芯片手册受 NDA 保密协议约束，官方不对外公开完整文档。但通过开源社区多年对 SJCAM、GoXtreme、Viofo 等基于联咏主控设备的逆向工程，其核心通信协议与系统架构已被完全整理出来。
+1. 准备本地 SPM 依赖：将 [KSPlayer](https://github.com/kingslay/KSPlayer) 与 [FFmpegKit](https://github.com/kingslay/FFmpegKit) 克隆到**与本仓库同级的目录**（`Package.swift` 会自动按相对路径 `../../KSPlayer`、`../../FFmpegKit` 查找）：
 
-以下为你整理的**联咏 Novatek 全量通信协议 API 文档**与**固件底层技术架构指南**。
+   ```bash
+   cd /path/to/parent
+   git clone https://github.com/kingslay/KSPlayer.git
+   git clone https://github.com/kingslay/FFmpegKit.git
+   ```
 
----
+   > FFmpegKit 仓库约 670MB（二进制直接在仓库内），克隆较慢请耐心等待。
 
-**一、 联咏 Wi-Fi CGI 控制协议全集**
+2. 用 Xcode 打开 `ios/NovaDash.xcodeproj`，在 Signing & Capabilities 中选择自己的开发团队，修改 Bundle Identifier 为唯一值。
 
-通信基准：`http://192.168.1.254/?custom=1&cmd=[CMD]&par=[PAR]`（部分命令用 `str=` 传字符串参数，如 `&str=1`）
-响应格式：`<Function><Cmd>CMD</Cmd><Status>0</Status><Value>VAL</Value></Function>`（`Status=0` 表示成功，负数表示错误）
+3. 连接 iPhone 真机运行（首次需在 设置 → 通用 → VPN 与设备管理 中信任开发者证书）。
 
-**0. 重要坑位说明（实测总结）**
+4. 手机连接记录仪 Wi-Fi 后打开 NovaDash，点击"连接记录仪"即可。
 
-* **HTTP 服务器是单线程的，禁止并发请求**：哪怕只是心跳和业务命令同时到达，也会导致连接被重置/服务长时间无响应。所有请求（含心跳）必须串行；控制命令执行期间让心跳让路。
-* **重命令后设备会"忙"几秒到几十秒**：实测（860N72-SF20200714 固件）"停止录像"秒回，但"恢复录像/切换模式"后 HTTP 长时间无响应（读超时、连接重置）。**超时 ≠ 命令失败**——单线程服务器阻塞时命令可能已被执行，应轮询心跳等设备恢复后再查状态确认，而非凭超时判定。
-* **读超时后切勿自动重发状态命令**（`2001`/`3001`/`1001` 等）：请求会堆积到阻塞中的单线程服务器上，且命令可能被重复执行（实测"Max retries exceeded"请求风暴即由此而来）。重试策略应是：只重试连接建立失败（请求未送达，安全），读超时改为等待设备恢复；心跳在设备无响应时退避降频。
-* **参数名有 `par` 和 `str` 两种**：不同厂商固件对同一命令可能只认其中一种。例如录像控制 `2001`，GitUp Git2 用 `par=1/0`，而 BlackSys、860N72 等行车记录仪固件用 `str=1/0`（实测 `str` 成功停录）。参数名不对时返回 `-22`（EINVAL）。
-* **心跳必须保活**：`cmd=3016` 须每 3~5 秒发送一次，否则设备自动断开 Wi-Fi。
-* **文件列表需先切回放模式**：录像进行中（行车记录仪循环录像常开）直接查 `cmd=3015` 会被拒（返回 `-3`）。标准流程：`3001&par=2` 切回放模式 → `3015` 拉列表 → `3001&par=0` 切回视频模式。
-* **错误码即 Linux errno**：`-22`=EINVAL（参数无效/状态不允许，含重复停/开录像）、`-21`=`2001` 无参查询不支持（两轮实测）、`-5`=EIO 写卡失败（卡满/卡故障时 `1001` 拍照返回，格式化后复测）、`-13`=抓拍执行失败、`-3`=存储或状态错误、`-1`=不支持。
+> 真机运行时 iOS 会弹"本地网络"权限弹窗，必须允许，否则无法访问 `192.168.1.254`。
 
-**1. 系统状态与心跳类**
+## 协议要点（踩坑红线）
 
-* **发送心跳 (Keep-Alive)**: `cmd=3016`（APP 必须每 3~5 秒发送一次，否则设备自动断开 Wi-Fi）
-* **获取设备信息**: `cmd=3012`（返回固件版本、芯片型号，内容在 `<String>` 节点）
-* **查询全部配置**: `cmd=3014`
-* **恢复出厂设置**: `cmd=3011`（⚠️ 危险命令！会重置全部设置，不是"查询工作模式"）
-* **切换/查询工作模式**: `cmd=3001&par=[0/1/2]`（`0`: 视频模式, `1`: 拍照模式, `2`: 回放模式）
-* **同步日期**: `cmd=3005&str=YYYY-MM-DD`；**同步时间**: `cmd=3006&str=hh:mm:ss`（用于对齐时间戳）
-* **格式化 SD 卡**: `cmd=3010&str=1`
-* **查询 SD 卡状态**: `cmd=3024`（返回 `0`=无卡, `1`=正常, `2`=被锁定）
-* **查询剩余空间**: `cmd=3017`（返回字节数）
-* **查询电池状态**: `cmd=3019`（`0`=满, `1`=中, `2`=低, `3`=耗尽, `5`=充电中）
+记录仪内置的 HTTP 服务器有诸多硬性约束，完整协议见 [novatek-protocol.md](novatek-protocol.md)，iOS 端实测记录见 [iOS.md](iOS.md)。最关键的几条：
 
-**2. 录像与控制类**
+- **HTTP 服务是单线程的，所有请求必须串行**（包括心跳），并发会导致连接被重置
+- **心跳 `cmd=3016` 必须每 3~5 秒一次**，否则设备主动断开 Wi-Fi
+- **读超时 ≠ 命令失败**：重命令后设备会阻塞几秒到几十秒，严禁超时后重发状态命令（会造成请求堆积/重复执行），应轮询心跳等设备恢复
+- **录像中查文件列表会被拒**（返回 `-3`），需先 `3001&par=2` 切回放模式，查完 `3001&par=0` 切回并 `2001&str=1` 恢复录像
+- **下载 URL 规则**：`3015` 返回的 `A:\CARDV\MOVIE\x.TS` 去掉盘符前缀 → `http://192.168.1.254/CARDV/MOVIE/x.TS`
+- **RTSP 直播节点**：`rtsp://192.168.1.254/novatek/main`（主码流）、`rtsp://192.168.1.254/novatek/sub`（子码流低延迟）
 
-* **录像控制**: `cmd=2001`（`str=1`/`par=1`: 开始录像, `str=0`/`par=0`: 停止录像，两种参数名取决于固件；不带参数时部分固件返回当前录像状态 `1`/`0`）
-* **设置视频分辨率**: `cmd=2002&par=[枚举值]`（不是"查询录像状态"）
-* **普通模式拍照**: `cmd=1001`（需要先停止录像或处于拍照模式；成功时响应含 `<File><FPATH>` 照片保存路径）
-* **录像中抓拍快照**: `cmd=2017`（无需打断录像；失败时固件返回 `-13`）
-* **设置照片分辨率**: `cmd=1002&par=[枚举值]`（不是"抓拍"）
-* **查询剩余可拍张数**: `cmd=1003`
-* **查询本次最大录像时长**: `cmd=2009`（开始录像前可先查询）
+## 目录结构
 
-**3. 相册与文件管理类**
+```
+open-nova-dash/
+├── script.py              # CLI 入口：子命令与 iOS 页面一一对应
+├── nova_dash/             # Python 实现，按 iOS 功能页面拆分
+│   ├── core.py                # CGI 驱动（串行锁/收发/失联恢复等待）
+│   ├── connection.py          # 连接探测 + 心跳保活
+│   ├── dashboard.py           # 状态仪表盘
+│   ├── album.py               # 文件列表 + 下载
+│   └── control.py             # 拍照/录像/直播节点/格式化
+├── pyproject.toml         # Python 项目配置
+├── novatek-protocol.md    # 联咏 Wi-Fi CGI 协议（当前硬件实测版）
+├── iOS.md                 # iOS 端实现设计与协议实测记录
+└── ios/
+    ├── NovaDash.xcodeproj
+    └── NovaDash/
+        ├── NovaDashApp.swift      # 入口 + 连接状态机 + 待连接页
+        ├── Core/
+        │   ├── NovatekClient.swift    # CGI 驱动（actor + 优先级串行信号量）
+        │   ├── ConnectionModel.swift  # 连接/心跳状态机
+        │   ├── Models.swift           # 文件模型与按天分组
+        │   ├── ThumbnailStore.swift   # 封面两级缓存（内存 + 磁盘）
+        │   ├── FFmpegThumb.swift      # FFmpeg C API 抽帧
+        │   └── AsyncSemaphore.swift   # 优先级信号量
+        └── Views/
+            ├── DashboardView.swift    # 状态仪表盘
+            ├── AlbumView.swift        # 相册 + 照片查看器 + 视频播放
+            └── ControlView.swift      # 控制台 + RTSP 直播
+```
 
-* **获取文件列表**: `cmd=3015`（返回 SD 卡内部 XML 格式的文件树，路径在 `<File><FPATH>` 节点；⚠️ 录像中会被拒，需先切回放模式 `3001&par=2`）
-* **删除特定文件**: `cmd=4003&str=[filePath]`（例如 `str=A:\Movie\20260831_1000.MP4`）
-* **下载文件（实测可用）**: `http://192.168.1.254/CARDV/MOVIE/xxx.TS` —— URL 规则：去掉 `3015` 返回路径的 `A:` 盘符前缀（`A:\CARDV\...` → `/CARDV/...`）
-* **获取文件缩略图**: `http://192.168.1.254/CARDV/MOVIE/xxx.TS?custom=1&cmd=4001`（`4001` 待实测）
+## 致谢
 
-**4. 实时视频流 (RTSP) 节点**
+协议整理参考了开源社区的逆向成果（GoXtreme-Wi-Fi-API 等，详见 [novatek-protocol.md](novatek-protocol.md) 第三节），播放能力基于 [KSPlayer](https://github.com/kingslay/KSPlayer) / [FFmpegKit](https://github.com/kingslay/FFmpegKit)。
 
-* **主码流 (高清 1080P/4K)**: `rtsp://192.168.1.254/novatek/main`
-* **子码流 (标清/低延迟)**: `rtsp://192.168.1.254/novatek/sub`
-* **HTTP-FLV 预览流 (部分型号)**: `[http://192.168.1.254:8080/live](http://192.168.1.254:8080/live)`
-
----
-
-**二、 联咏芯片底层开发与固件架构**
-
-如果你计划做深度系统重构或串口拆机编译，联咏的嵌入式系统具有以下技术特征：
-
-* **操作系统架构**: 双核/单核 Linux Kernel (通常为 Linux 3.10 / 4.9) + eCos RTOS 混合架构。
-* **交叉编译工具链**: `arm-ca9-linux-gnueabihf-` 或 `arm-linux-uclibcgnueabihf-`。
-* **硬件抽象层 (HDAL)**: 联咏的核心视频处理库（媒体处理框架，类似于海思的 MPP），负责 Sensor 图像输入（VI）、视频编码（VENC，H.264/H.265）以及图像算法处理。
-* **固件打包格式**: 升级文件通常为 `FW966X.bin`，可使用 `binwalk -e` 解包，内部包含 `u-boot.bin`、`uImage` (Kernel) 以及 `rootfs.squashfs`。
-
----
-
-**三、 社区开源逆向工程参考**
-
-可以在 GitHub 上检索以下项目获取更详尽的源代码实现与逆向成果：
-
-* **GoXtreme-Wi-Fi-API**: 完整的 Novatek 动作相机 API 映射表。
-* **rtsp-stream-converter**: 专为联咏芯片打造的 RTSP 实时抓帧与转发中间件。
-* **nvt-tools**: 用于提取和解包联咏 `.bin` 固件的 Python 工具集。
+仅供学习研究使用，使用本项目中"格式化 SD 卡""恢复出厂设置"等危险命令造成的后果请自行承担。

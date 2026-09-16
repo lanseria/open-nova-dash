@@ -1,372 +1,104 @@
-"""联咏 (Novatek) 行车记录仪 CGI 控制与诊断脚本.
+"""联咏 (Novatek) 行车记录仪控制脚本 -- CLI 入口.
 
-v6 变更 (针对 "Max retries exceeded" 请求堆积问题):
-1. 重试策略修正: 只重试"连接建立失败"(请求未送达, 安全); 读超时一律不自动
-   重发 -- v5 的 read=1 重试会把 2001 这类状态命令重复发给阻塞中的单线程
-   服务器, 请求堆积且可能重复执行 (即日志中 Max retries exceeded 的来源).
-2. 心跳自适应退避: 连续失败后降频到 15s, 不再以 3s 节奏敲阻塞中的设备,
-   恢复成功后自动回到正常节奏.
-3. 录像控制流程改为"超时先等恢复再补发": 中间无意义的 2001 无参查询移除
-   (两轮实测 -21, 本机不支持); 恢复响应后补发的 str=1 是安全操作
-   (若已在录像只会返回 -22, 无副作用).
-4. wait_device_back 探测间隔放宽到 3s, 减少对阻塞设备的请求密度.
+子命令与 iOS 客户端的功能页面一一对应:
 
-v5 变更 (基于 860N72-SF20200714 固件四轮实测):
-1. 实测 3015 完全可用: 直接返回文件树(无 Status), 照片在 A:\\CARDV\\PHOTO\\*.JPG,
-   循环录像在 A:\\CARDV\\MOVIE\\*.TS; 早期测试拍的照片已确认落卡.
-2. 卡写满(剩 0.21GB/344个TS)是该设备的当前根因: 1001 拍照 -5(EIO 写卡失败),
-   2001 开始/停止录像 -22 或长时间阻塞并拖死 HTTP.
-   新增显式确认的格式化入口: uv run script.py --format-sd
-3. 2001 无参数查询返回 -21: 本机不支持查询变体, 录像状态只能靠命令反馈推断.
-4. 失联恢复等待加长到 60s (实测卡满时设备可阻塞 30s 以上).
+    uv run script.py connect              # 连接页: 探测设备 + 心跳保活演示
+    uv run script.py status               # 状态页: 固件/SD 卡/空间/电池仪表盘
+    uv run script.py album                # 相册页: 文件列表
+    uv run script.py album --download 关键字   # 相册页: 按文件名子串下载到 ./downloads/
+    uv run script.py control --capture    # 控制页: 拍照 (安全连招, 收尾恢复录像)
+    uv run script.py control --record on|off   # 控制页: 开始/停止录像
+    uv run script.py control --live       # 控制页: RTSP 直播节点
+    uv run script.py control --format-sd  # 控制页: 格式化 SD 卡 (需输入 yes)
+    uv run script.py all                  # 完整回归: 状态 → 相册 → 拍照 → 录像
+    (兼容 v6: uv run script.py --format-sd 等价于 control --format-sd)
 
-v4 变更:
-1. 3015 按 <FPATH> 判定成功, 不依赖 Status.
-2. 2001 状态机敏感: str=0 只在录像中有效, str=1 只在空闲时有效, 重复同状态 -22;
-   录像控制改为状态感知流程, 收尾确保回到录像状态(本机切模式不自动恢复循环录像).
-3. 修复 XML 元素 truthiness 误判; 2017 挪到"确认录像中"后复测.
-
-v3 变更:
-1. 本机 2001 录像控制用 str= 传参 (par= 返回 -22).
-2. 单线程 HTTP 服务器: 所有请求(含心跳)经锁串行; 重命令长超时+自动重试;
-   录像控制放最后避免拖垮前面测试; wait_device_back() 轮询恢复.
+所有页面都先连接设备(3 次探测)并启动 3s 心跳, 结束自动停止 --
+与 iOS 端 ConnectionModel 的生命周期一致. 实现按页面拆分在 nova_dash/ 包中.
 """
 
+from __future__ import annotations
+
+import argparse
 import sys
-import threading
 import time
-import xml.etree.ElementTree as ET
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from nova_dash import album, connection, control, core, dashboard
 
-BASE_URL = "http://192.168.1.254"
-HEARTBEAT_INTERVAL = 3.0  # readme: 必须每 3~5 秒心跳一次
-HEARTBEAT_BACKOFF_INTERVAL = 15.0  # 设备无响应时的心跳退避间隔
-
-# 负数 Status 与 Linux errno 编号一致, 以下是实测/社区文档中出现过的:
-ERROR_HINTS = {
-    -1: "不支持/被拒绝",
-    -3: "存储或状态错误: 录像中查文件列表、SD 卡未就绪时常见",
-    -5: "EIO 写卡失败: 卡满或卡故障, 备份后格式化 (本机实测卡满时 1001 拍照返回此码)",
-    -13: "抓拍执行失败 (exec fail)",
-    -21: "本机实测于 2001 无参数查询: 查询变体大概率不支持",
-    -22: "EINVAL 参数无效: 固件不认这个参数名/参数值, 或当前状态不允许",
-}
-
-# 联咏固件的 HTTP 服务器是单线程的: 并发请求(哪怕只是心跳)会导致
-# 连接被重置/服务长时间无响应, 因此所有请求必须经此锁串行.
-CMD_LOCK = threading.Lock()
-
-session = requests.Session()
-# 单连接池; 仅重试"连接建立失败"(TCP 未建成、请求未送达, 重试安全).
-# 读超时一律不自动重发 (read=0): 2001/3001/1001 这类状态命令重复执行有风险,
-# 且设备阻塞时重发只会让请求堆积 (v5 实测的 Max retries exceeded 即来源于此).
-session.mount(
-    "http://",
-    HTTPAdapter(
-        pool_connections=1,
-        pool_maxsize=1,
-        max_retries=Retry(
-            total=1, connect=1, read=0, backoff_factor=0.3,
-            allowed_methods=frozenset(["GET"]),
-        ),
-    ),
-)
-
-heartbeat_stop = threading.Event()
+SUBCOMMANDS = ("all", "album", "connect", "control", "status")
 
 
-def heartbeat_loop():
-    fail_streak = 0
-    while not heartbeat_stop.wait(HEARTBEAT_INTERVAL if fail_streak < 2 else HEARTBEAT_BACKOFF_INTERVAL):
-        if not CMD_LOCK.acquire(blocking=False):
-            continue  # 有命令正在处理, 本轮心跳让路, 等下一周期
-        try:
-            session.get(BASE_URL + "/", params={"custom": 1, "cmd": 3016}, timeout=2)
-            fail_streak = 0
-        except requests.RequestException:
-            # 连续失败说明设备阻塞/失联, 退避降频, 别拿请求砸单线程服务器
-            fail_streak += 1
-        finally:
-            CMD_LOCK.release()
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    # 兼容 v6 入口: uv run script.py --format-sd
+    if "--format-sd" in argv and not (set(argv) & set(SUBCOMMANDS)):
+        argv = ["control", *argv]
 
-
-def raw_cmd(cmd, par=None, str_par=None, timeout=4):
-    params = {"custom": 1, "cmd": cmd}
-    if par is not None:
-        params["par"] = par
-    if str_par is not None:
-        params["str"] = str_par
-    resp = session.get(BASE_URL + "/", params=params, timeout=timeout)
-    return ET.fromstring(resp.text.strip())
-
-
-def describe_status(root):
-    text = root.findtext("Status") if root is not None else None
-    if text is None:
-        return "⚠️ 响应中无 Status 字段"
-    try:
-        code = int(text)
-    except ValueError:
-        return f"Status={text}"
-    if code == 0:
-        return "✅ 成功"
-    hint = ERROR_HINTS.get(code)
-    return f"❌ 失败 (Status={code}" + (f": {hint})" if hint else ")")
-
-
-def is_ok(root):
-    return root is not None and root.findtext("Status") == "0"
-
-
-def extract_fpath(root):
-    """从响应中取第一个 <FPATH> (拍照成功时返回照片保存路径)."""
-    if root is None:
-        return None
-    return next((e.text.strip() for e in root.iter("FPATH") if e.text and e.text.strip()), None)
-
-
-def parse_file_list(root):
-    """解析 3015 响应为路径列表; 本机固件直接返回文件树, 无 Status 包裹."""
-    if root is None:
-        return None
-    return [e.text.strip() for e in root.iter("FPATH") if e.text and e.text.strip()] or None
-
-
-def send_cmd(cmd, par=None, str_par=None, description="", timeout=4):
-    """发送 CGI 指令并解析 XML 响应, 返回 XML 根节点(失败返回 None)."""
-    param_desc = (
-        f"str={str_par}" if str_par is not None
-        else f"par={par}" if par is not None
-        else "无参数"
+    parser = argparse.ArgumentParser(
+        description="联咏 Novatek 行车记录仪控制脚本 (子命令与 iOS 页面一一对应)",
     )
-    print(f"\n【测试】{description} (cmd={cmd}, {param_desc})")
+    parser.add_argument("page", nargs="?", default="status", choices=SUBCOMMANDS,
+                        help="功能页面 (默认: status)")
+    parser.add_argument("--download", metavar="关键字",
+                        help="album: 按文件名子串下载匹配文件到 ./downloads/")
+    parser.add_argument("--capture", action="store_true", help="control: 拍照")
+    parser.add_argument("--record", choices=["on", "off"], help="control: 开始/停止录像")
+    parser.add_argument("--live", action="store_true", help="control: 打印 RTSP 直播节点")
+    parser.add_argument("--format-sd", action="store_true",
+                        help="control: 格式化 SD 卡 (危险操作, 需输入 yes 确认)")
+    return parser.parse_args(argv)
+
+
+def run_all(client) -> None:
+    """完整回归 (v6 流程, 去掉本机已证伪的 2017 抓拍): 状态 → 相册 → 拍照 → 录像."""
+    dashboard.page_status(client)
+    album.page_album(client)
+    control.capture(client)
+
+    print("\n" + "=" * 40)
+    print(" 录像控制回归 (cmd=2001&str=)")
+    print("=" * 40)
+    control.set_record(client, True)
+    control.set_record(client, False)
+    # 收尾: 行车记录仪必须回到循环录像状态 (本机切模式不自动恢复录像)
+    if not control.set_record(client, True):
+        print("  ⚠️ 未能确认恢复录像, 请检查设备屏幕!")
+
+
+def main() -> None:
+    args = parse_args(sys.argv[1:])
+    client = core.NovatekClient()
+    keeper = connection.HeartbeatKeeper(client)
+
+    # 连接生命周期与 iOS 一致: 先探测, 成功后才启动心跳
+    if not connection.connect(client):
+        print("\n❌ 无法连接记录仪 (192.168.1.254), 请检查:")
+        print("   1. 本机是否已连接记录仪 Wi-Fi")
+        print("   2. 网关是否为 192.168.1.254 (macOS: netstat -nr | grep default)")
+        sys.exit(1)
+    print("✅ 已连接, 启动心跳保活 (3s)")
+    keeper.start()
+
     try:
-        with CMD_LOCK:
-            root = raw_cmd(cmd, par, str_par, timeout)
-    except requests.RequestException as e:
-        print(f"  └─ 请求异常: {type(e).__name__}: {e}")
-        if "Read timed out" in str(e) or "ReadTimeoutError" in str(e):
-            print("      (读超时=设备阻塞处理中; 已配置为不自动重发, 避免状态命令重复执行)")
-        return None
-    except ET.ParseError:
-        print(f"  └─ 非标准 XML 响应")
-        return None
+        if args.page == "connect":
+            print("\n心跳保活演示 10s (对应 iOS 连接成功后的持续监控)...")
+            time.sleep(10)
+            print(f"  ✅ 心跳正常, 累计 {keeper.beat_count} 次")
+        elif args.page == "status":
+            dashboard.page_status(client)
+        elif args.page == "album":
+            album.page_album(client, args.download)
+        elif args.page == "control":
+            control.page_control(client, args)
+        elif args.page == "all":
+            run_all(client)
+    finally:
+        keeper.stop()
 
-    print(f"  └─ 结果: {describe_status(root)}")
-    # 打印返回的数据字段: 版本在 <String>, 查询结果在 <Value>, 拍照路径在 <File><FPATH>
-    for child in root:
-        text = (child.text or "").strip()
-        if child.tag in ("Cmd", "Status") or not text:
-            continue
-        print(f"      {child.tag}: {text[:200]}")
-    return root
-
-
-def wait_device_back(max_wait=30, description="等待设备恢复响应"):
-    """设备 HTTP 失联时轮询心跳, 直到恢复或超时. 返回心跳响应根节点."""
-    print(f"\n⏳ {description} (最多 {max_wait}s)...")
-    start = time.time()
-    deadline = start + max_wait
-    while time.time() < deadline:
-        if not CMD_LOCK.acquire(blocking=False):
-            time.sleep(1)
-            continue
-        try:
-            root = raw_cmd(3016, timeout=3)
-            print(f"  ✅ 设备已恢复响应 (耗时约 {time.time() - start:.0f}s)")
-            return root
-        except (requests.RequestException, ET.ParseError):
-            time.sleep(3)
-        finally:
-            CMD_LOCK.release()
-    print("  ❌ 仍未恢复: 设备可能还在忙, 稍等后重跑脚本, 或查看设备屏幕状态")
-    return None
-
-
-def print_file_list(paths, max_items=15):
-    if not paths:
-        print("  (文件列表为空或本固件的列表结构不同)")
-        return
-    photos = [p for p in paths if p.upper().endswith((".JPG", ".JPEG"))]
-    videos = [p for p in paths if p.upper().endswith((".MP4", ".MOV", ".TS"))]
-    others = [p for p in paths if p not in photos and p not in videos]
-    print(f"  📁 共 {len(paths)} 个文件: {len(photos)} 张照片, {len(videos)} 个视频, {len(others)} 其他")
-    for label, group in (("照片", photos), ("视频", videos), ("其他", others)):
-        for p in group[:max_items]:
-            print(f"      [{label}] {p}")
-        if len(group) > max_items:
-            print(f"      ... 其余 {len(group) - max_items} 个省略")
-
-
-def diagnose():
-    print("=" * 40)
-    print(" 第 1 步: 设备状态诊断 (全部为只读查询)")
-    print("=" * 40)
-    root = send_cmd(3012, description="查询设备信息与版本")
-    firmware = root.findtext("String") if root is not None else None
-    if firmware:
-        print(f"  🔖 固件: {firmware}")
-
-    root = send_cmd(3024, description="查询 SD 卡状态 (0=无卡 1=正常 2=被锁定)")
-    if root is not None and root.findtext("Value") == "0":
-        print("  ⚠️ SD 卡未插入! 录像/拍照/文件列表都会失败, 请先插卡再测")
-
-    root = send_cmd(3017, description="查询剩余存储空间 (字节)")
-    if root is not None:
-        value = root.findtext("Value")
-        if value and value.isdigit():
-            gb = int(value) / 1024**3
-            print(f"      ≈ {gb:.2f} GB 可用")
-            if gb < 0.5:
-                print("  ⚠️ 卡快满了: 循环覆盖清理会拖慢启动录像, 建议备份后在设备上格式化")
-
-    send_cmd(3019, description="查询电池状态 (0=满 1=中 2=低 3=耗尽 5=充电中)")
-
-
-def test_file_list():
-    print("\n" + "=" * 40)
-    print(" 第 2 步: 文件列表测试 (cmd=3015)")
-    print("=" * 40)
-
-    # 本机固件的 3015 直接返回文件树 XML(无 Status 包裹), 以 FPATH 判定成败
-    root = send_cmd(3015, description="直接查询文件列表", timeout=12)
-    paths = parse_file_list(root)
-    if paths:
-        print("  → 成功: 本机 3015 直接返回文件树")
-        print_file_list(paths)
-        return
-
-    print("  → 响应无 FPATH, 改走联咏 APP 相册标准流程: 先切回放模式再查")
-    send_cmd(3001, par=2, description="切换到回放模式 (par=2)", timeout=12)
-    time.sleep(2)
-
-    root = send_cmd(3015, description="回放模式下查询文件列表", timeout=12)
-    paths = parse_file_list(root)
-    if paths:
-        print_file_list(paths)
-    else:
-        print("  ⚠️ 回放模式下也无文件, 请结合第 1 步 SD 卡状态排查")
-
-    send_cmd(3001, par=0, description="切回视频模式", timeout=12)
-    time.sleep(3)
-
-
-def test_capture():
-    print("\n" + "=" * 40)
-    print(" 第 3 步: 拍照测试 (cmd=1001)")
-    print("=" * 40)
-
-    # 方式 A: 直接 1001 (v1 时代实测本机在录像中发 1001 也返回过成功;
-    # 上轮照片模式下返回 -5 = errno EIO, 疑似卡快满写卡失败, 格式化后应复测)
-    root = send_cmd(1001, description="方式 A: 直接拍照 (cmd=1001)", timeout=6)
-    fpath = extract_fpath(root)
-    if is_ok(root) or fpath:
-        if fpath:
-            print(f"  📷 照片已保存: {fpath}")
-        print("  → 直接拍照可用, 无需切换模式")
-        return
-
-    print("  → 直接拍照失败, 改用模式切换法")
-    print("\n--- 方式 B: 切换模式拍照 ---")
-    send_cmd(3001, par=1, description="切换到照片模式 (par=1)", timeout=12)
-    time.sleep(2)
-
-    root = send_cmd(1001, description="执行拍照 (cmd=1001)", timeout=6)
-    fpath = extract_fpath(root)
-    if fpath:
-        print(f"  📷 照片已保存: {fpath}")
-    else:
-        status = root.findtext("Status") if root is not None else None
-        hint = "(-5 = EIO 写卡失败, 卡快满时常见, 建议格式化后复测)" if status == "-5" else ""
-        print(f"  ⚠️ 拍照未确认 {hint}")
-    time.sleep(1.5)
-
-    send_cmd(3001, par=0, description="切回视频模式", timeout=12)
-    time.sleep(3)
-
-
-def test_record_control():
-    print("\n" + "=" * 40)
-    print(" 第 4 步: 录像控制测试 (cmd=2001, 放最后避免拖垮前面测试)")
-    print(" 本机实测: str=0 只在录像中有效, str=1 只在空闲时有效,")
-    print(" 重复同状态命令返回 -22; 2001 无参查询两轮实测 -21(不支持)已移除")
-    print("=" * 40)
-
-    # 1. 开始录像 (-22 = 已在录像中)
-    root = send_cmd(2001, str_par=1, description="开始录像 (str=1; -22=已在录像中)", timeout=15)
-    if is_ok(root):
-        print("  → 已发出开始录像指令, 等待设备稳定...")
-        time.sleep(3)
-    elif root is None:
-        # 读超时无法判定命令是否已被执行, 不重发; 先等设备恢复再继续
-        wait_device_back(60, "设备无响应 (不重发命令, 避免重复执行)")
-
-    # 2. 此刻应处于录像中: 复测 2017 抓拍 (空闲状态下测得的 -22 不能下结论)
-    root = send_cmd(2017, description="录像中复测抓拍 (cmd=2017)", timeout=6)
-    if is_ok(root):
-        print("  → 2017 录像中抓拍可用! APP 抓拍可免切模式")
-    else:
-        print("  → 2017 不可用, APP 抓拍走 1001 直接拍或模式切换法")
-    time.sleep(1)
-
-    # 3. 停止录像
-    root = send_cmd(2001, str_par=0, description="停止录像 (str=0; -22=本就不在录像)", timeout=12)
-    if is_ok(root):
-        time.sleep(2)
-    elif root is None:
-        wait_device_back(60, "停止录像后设备无响应, 等待恢复 (不重发)")
-
-    # 4. 收尾: 行车记录仪必须回到循环录像状态(本机切视频模式不会自动恢复)
-    root = send_cmd(2001, str_par=1, description="恢复录像 (str=1, 确保记录仪回到工作状态)", timeout=15)
-    if root is None:
-        # 恢复响应后补发一次是安全的: 若已在录像只会返回 -22, 无副作用
-        if wait_device_back(60, "设备无响应, 等待恢复") is not None:
-            send_cmd(2001, str_par=1, description="补发恢复录像 (str=1; -22=已在录像, 无副作用)", timeout=15)
-    time.sleep(3)
-    send_cmd(3017, description="收尾: 查询剩余空间 (设备存活确认, 兼看循环录像写卡)")
-
-
-def format_sd():
-    """显式确认后才执行的 SD 卡格式化 (uv run script.py --format-sd)."""
-    print("=" * 40)
-    print(" ⚠️  SD 卡格式化 (cmd=3010&str=1)")
-    print("=" * 40)
-    print("卡上全部文件 (循环录像/照片/锁定片段) 将被永久删除!")
-    print("如未备份, 请先通过文件列表确认并下载需要保留的文件.")
-    answer = input("确认已备份并继续格式化? 输入 yes 执行: ").strip().lower()
-    if answer != "yes":
-        print("已取消, 未做任何改动.")
-        return
-    root = send_cmd(3010, str_par=1, description="格式化 SD 卡", timeout=30)
-    if is_ok(root):
-        print("  → 已发出格式化指令, 设备需要时间重建文件系统")
-        wait_device_back(60, "等待格式化完成")
-        send_cmd(3017, description="格式化后查询剩余空间 (应接近卡总容量)")
+    print("\n=== 完成 ===")
+    print("提示: 中途失联多为设备卡满/卡死, 断电重启即可恢复;")
+    print("      卡满是拍照(-5)/录像(-22) 异常的常见根因, 备份后运行:")
+    print("      uv run script.py control --format-sd")
 
 
 if __name__ == "__main__":
-    if "--format-sd" in sys.argv:
-        threading.Thread(target=heartbeat_loop, daemon=True).start()
-        format_sd()
-        heartbeat_stop.set()
-        raise SystemExit(0)
-
-    print("=== 联咏 Novatek 行车记录仪控制指令测试 (v6) ===")
-    print("说明: Status<0 为错误码(即 Linux errno), 括号内为常见含义;")
-    print("      卡满时 1001/2001 异常属预期, 先格式化 (uv run script.py --format-sd)")
-
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
-
-    diagnose()
-    test_file_list()
-    test_capture()
-    test_record_control()
-
-    heartbeat_stop.set()
-    print("\n=== 测试结束 ===")
-    print("提示: 若第 4 步中途失联, 设备大概率已卡死, 断电重启即可恢复;")
-    print("      卡满(剩0.2GB)是当前 1001/-5 与 2001 异常的根因, 备份后运行:")
-    print("      uv run script.py --format-sd")
+    main()

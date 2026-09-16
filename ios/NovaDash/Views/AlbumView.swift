@@ -1,7 +1,7 @@
 import SwiftUI
 import Photos
-import AVKit
 import ImageIO
+import KSPlayer
 
 @MainActor
 @Observable
@@ -56,7 +56,9 @@ final class AlbumModel {
         }
     }
 
-    func load() async {
+    /// force=false 时使用内存缓存 (切换页面不重复请求); 仅下拉刷新强制拉取
+    func load(force: Bool = false) async {
+        if !force, !files.isEmpty { return }
         isLoading = true
         errorText = nil
         do {
@@ -113,12 +115,7 @@ final class AlbumModel {
 struct AlbumView: View {
     @State private var model = AlbumModel()
     @State private var viewerGroup: FileGroup?
-    @State private var shareFile: SharedFile?
-
-    struct SharedFile: Identifiable {
-        let id = UUID()
-        let url: URL
-    }
+    @State private var streamingFile: DashcamFile?
 
     var body: some View {
         NavigationStack {
@@ -145,7 +142,7 @@ struct AlbumView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("相册")
-            .refreshable { await model.load() }
+            .refreshable { await model.load(force: true) }
             .task { await model.load() }
             .overlay {
                 if model.isLoading && model.files.isEmpty {
@@ -160,8 +157,8 @@ struct AlbumView: View {
             .fullScreenCover(item: $viewerGroup) { group in
                 PhotoViewer(model: model, photos: group.files)
             }
-            .sheet(item: $shareFile) { item in
-                ActivityView(url: item.url)
+            .sheet(item: $streamingFile) { file in
+                VideoStreamSheet(file: file)
             }
         }
     }
@@ -258,17 +255,8 @@ struct AlbumView: View {
             let photos = (group?.files ?? [file]).filter { $0.kind == .photo }
             viewerGroup = FileGroup(day: file.day, files: photos.isEmpty ? [file] : photos)
         case .video:
-            // iOS (AVFoundation) 无法解码记录仪的 TS 流: 已缓存 → 直接分享;
-            // 未缓存 → 触发下载, 完成后用分享按钮交给 VLC/Infuse 等播放器
-            switch model.downloads[file.id] {
-            case .done(let url):
-                shareFile = SharedFile(url: url)
-            case .running:
-                model.toast = "视频正在下载, 完成后可分享给播放器打开"
-            default:
-                Task { await model.download(file) }
-                model.toast = "iOS 无法直接播放 TS, 正在下载; 完成后点 ↥ 分享给 VLC 等播放器"
-            }
+            // FFmpeg (KSPlayer) 直接拉设备的 HTTP-TS 流播放, 无需先下载
+            streamingFile = file
         case .other:
             break
         }
@@ -431,14 +419,73 @@ private struct PhotoViewer: View {
     }
 }
 
-// MARK: - 系统分享面板 (TS 视频交给 VLC/Infuse 等播放器)
+// MARK: - 视频在线播放 (KSPlayer/FFmpeg 直接拉设备 TS 流)
 
-private struct ActivityView: UIViewControllerRepresentable {
-    let url: URL
+private struct VideoStreamSheet: View {
+    let file: DashcamFile
 
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    @StateObject private var coordinator = KSVideoPlayer.Coordinator()
+    @State private var errorText: String?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                KSVideoPlayer(
+                    coordinator: coordinator,
+                    url: NovatekClient.shared.streamURL(for: file),
+                    options: makeOptions()
+                )
+                .aspectRatio(16 / 9, contentMode: .fit)
+                .background(Color.black)
+
+                if let errorText {
+                    Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .padding(.horizontal)
+                } else {
+                    Text("FFmpeg 实时拉流播放; 需要离线保存时用卡片上的 ↓ 按钮下载")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal)
+                }
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
+            .background(Color(.systemBackground))
+            .navigationTitle(file.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+            .onAppear { bindCallbacks() }
+            .onDisappear { coordinator.resetPlayer() }
+        }
     }
 
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+    private func makeOptions() -> KSOptions {
+        let options = KSOptions()
+        options.isLoopPlay = false
+        return options
+    }
+
+    private func bindCallbacks() {
+        coordinator.onFinish = { _, error in
+            Task { @MainActor in
+                if let error {
+                    errorText = "播放失败: \(error.localizedDescription)"
+                }
+            }
+        }
+        coordinator.onStateChanged = { _, state in
+            Task { @MainActor in
+                if state == .bufferFinished || state == .readyToPlay {
+                    errorText = nil
+                }
+            }
+        }
+    }
 }

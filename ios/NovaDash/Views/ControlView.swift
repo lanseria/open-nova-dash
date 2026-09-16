@@ -1,4 +1,5 @@
 import SwiftUI
+import KSPlayer
 
 @MainActor
 @Observable
@@ -26,7 +27,7 @@ final class ControlModel {
                 let name = DashcamFile(rawPath: path, kind: .other).name
                 return "已拍照: \(name)"
             }
-            return "拍照指令已接受 (未返回路径, 请到相册确认)"
+            return "拍照指令已发出 (设备忙未回执, 请到相册确认)"
         }
     }
 
@@ -38,6 +39,7 @@ final class ControlModel {
             case .stopped: return "已停止录像"
             case .alreadyStarted: return "设备本就在录像中"
             case .alreadyStopped: return "设备本就已停止"
+            case .sentUnconfirmed: return "指令已发出, 设备忙未回执; 请稍后通过画面或指示灯确认 (超时不代表失败)"
             }
         }
     }
@@ -45,8 +47,11 @@ final class ControlModel {
 
 struct ControlView: View {
     @State private var model = ControlModel()
-    @State private var stream = RTSPStreamModel()
-    @AppStorage("rtspURL") private var rtspURL = "rtsp://192.168.1.254/stream0"
+    @AppStorage("rtspURL") private var rtspURL = "rtsp://192.168.1.254/novatek/sub"
+    @StateObject private var liveCoordinator = KSVideoPlayer.Coordinator()
+    @State private var isLiveOn = false
+    @State private var liveStatus: String?
+    @State private var liveError: String?
 
     var body: some View {
         NavigationStack {
@@ -63,7 +68,7 @@ struct ControlView: View {
                 } header: {
                     Text("远程拍照")
                 } footer: {
-                    Text("优先直接拍照; 状态不允许时自动切换照片模式拍完再切回(约 5 秒)。若提示存储写入失败, 请备份后在设备上格式化 SD 卡。")
+                    Text("优先直接拍照 (录像中实测可用); 状态不允许时自动切照片模式拍完再切回并恢复录像。若提示存储写入失败, 请备份后在设备上格式化 SD 卡。")
                 }
 
                 Section {
@@ -107,96 +112,129 @@ struct ControlView: View {
                 }
             }
             .navigationTitle("控制")
-            .onDisappear { stream.stop() }
+            .onAppear {
+                // 旧版本遗留的错误地址 → 迁移到实测可用的子码流
+                if Self.legacyAddresses.contains(rtspURL) {
+                    rtspURL = "rtsp://192.168.1.254/novatek/sub"
+                }
+            }
+            .onDisappear { stopLive() }
         }
     }
 
-    // MARK: - RTSP 实时流
+    // MARK: - RTSP 实时流 (KSPlayer / FFmpeg 软解)
 
     @ViewBuilder
     private var liveSection: some View {
         Section {
-            switch stream.phase {
-            case .streaming:
-                RTSPSurface(model: stream)
+            if isLiveOn, let liveURL = URL(string: rtspURL) {
+                KSVideoPlayer(coordinator: liveCoordinator, url: liveURL, options: makeLiveOptions())
                     .aspectRatio(16 / 9, contentMode: .fit)
                     .frame(maxWidth: .infinity)
                     .listRowInsets(EdgeInsets())
                     .background(Color.black)
-                LabeledContent("帧数", value: "\(stream.frameCount)")
-                    .font(.footnote.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Button(role: .destructive) {
-                    stream.stop()
-                } label: {
-                    Label("停止直播", systemImage: "stop.fill")
-                }
-
-            case .connecting:
-                HStack {
-                    ProgressView()
-                    Text("正在连接 \(rtspURL) …")
+                if let liveStatus {
+                    LabeledContent("状态", value: liveStatus)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                if let liveError {
+                    Label(liveError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
                 Button(role: .destructive) {
-                    stream.stop()
+                    stopLive()
                 } label: {
-                    Label("取消", systemImage: "xmark.circle")
+                    Label("停止直播", systemImage: "stop.fill")
                 }
-
-            case .failed(let message):
+            } else {
                 TextField("RTSP 地址", text: $rtspURL)
                     .keyboardType(.URL)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .font(.footnote)
-                Menu {
-                    ForEach(Self.presets, id: \.self) { preset in
-                        Button(preset) { rtspURL = preset }
-                    }
-                } label: {
-                    Label("常用地址", systemImage: "list.bullet")
-                }
+                addressMenu
                 Button {
-                    stream.start(urlString: rtspURL)
-                } label: {
-                    Label("重新连接", systemImage: "play.rectangle.fill")
-                }
-                .disabled(rtspURL.isEmpty)
-
-            case .idle:
-                TextField("RTSP 地址", text: $rtspURL)
-                    .keyboardType(.URL)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                Menu {
-                    ForEach(Self.presets, id: \.self) { preset in
-                        Button(preset) { rtspURL = preset }
-                    }
-                } label: {
-                    Label("常用地址", systemImage: "list.bullet")
-                }
-                Button {
-                    stream.start(urlString: rtspURL)
+                    startLive()
                 } label: {
                     Label("开始直播", systemImage: "play.rectangle.fill")
                 }
                 .disabled(rtspURL.isEmpty)
+                if let liveError {
+                    Label(liveError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
             }
         } header: {
             Text("实时视频流 (RTSP)")
         } footer: {
-            Text("通过 RTSP/TCP 拉流并在本机硬解 (H.264)。不同固件的流地址不同, 可在「常用地址」里切换; 直播时设备较忙, 文件下载请稍后再试。离开本页自动断开。")
+            Text("readme 实测节点: 主码流 novatek/main (高清), 子码流 novatek/sub (低延迟, 预览推荐)。HTTP-FLV (8080/live) 暂未适配。直播时设备较忙, 文件下载请稍后再试。离开本页自动断开。")
         }
     }
 
-    private static let presets = [
+    private var addressMenu: some View {
+        Menu {
+            Button("主码流 (高清 1080P/4K)") { rtspURL = "rtsp://192.168.1.254/novatek/main" }
+            Button("子码流 (标清低延迟)") { rtspURL = "rtsp://192.168.1.254/novatek/sub" }
+        } label: {
+            Label("实测地址", systemImage: "list.bullet")
+        }
+    }
+
+    private static let legacyAddresses = [
         "rtsp://192.168.1.254/stream0",
         "rtsp://192.168.1.254/ch00_0.h264",
         "rtsp://192.168.1.254/live/ch00_0",
         "rtsp://192.168.1.254/h264",
     ]
+
+    private func startLive() {
+        guard let url = URL(string: rtspURL), url.scheme?.lowercased() == "rtsp" else {
+            liveError = "暂只支持 rtsp:// 地址 (HTTP-FLV 8080/live 未适配)"
+            return
+        }
+        liveError = nil
+        liveStatus = "连接中…"
+        bindLiveCallbacks()
+        isLiveOn = true
+    }
+
+    private func stopLive() {
+        isLiveOn = false
+        liveStatus = nil
+        liveCoordinator.resetPlayer()
+    }
+
+    private func bindLiveCallbacks() {
+        liveCoordinator.onStateChanged = { _, state in
+            Task { @MainActor in
+                switch state {
+                case .readyToPlay, .bufferFinished:
+                    liveStatus = "直播中"
+                    liveError = nil
+                case .preparing:
+                    liveStatus = "缓冲中…"
+                default:
+                    break
+                }
+            }
+        }
+        liveCoordinator.onFinish = { _, error in
+            Task { @MainActor in
+                if let error {
+                    liveError = "直播失败: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func makeLiveOptions() -> KSOptions {
+        let options = KSOptions()
+        options.nobuffer = true                 // 直播低延迟
+        options.codecLowDelay = true
+        options.isLoopPlay = false
+        options.registerRemoteControll = false  // 不占用系统控制中心
+        return options
+    }
 }

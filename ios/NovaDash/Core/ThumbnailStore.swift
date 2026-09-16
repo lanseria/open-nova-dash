@@ -1,5 +1,4 @@
 import UIKit
-import AVFoundation
 import ImageIO
 
 /// 卡片封面仓库: 照片降采样出缩略图, 视频从文件头部抽首帧做封面。
@@ -82,37 +81,26 @@ final class ThumbnailStore {
         return UIImage(cgImage: cg)
     }
 
-    /// 视频封面多级兜底:
+    /// 视频封面多级兜底 (全部走 FFmpeg 解码, 支持 iOS 不认的 TS/H.265):
     /// ① 设备端 .THM 伴生缩略图 (最准, 图小下载快);
-    /// ② 文件头部 1.5MB 抽帧 (H.264-AVC 的 TS 可行);
+    /// ② 文件头部 1.5MB 抽帧 (FFmpeg 对截断文件容错良好);
     /// ③ 已缓存完整文件抽帧 (不专门为封面触发大文件下载);
-    /// 都失败 → nil 占位 (TS 容器/编码 iOS 不支持时, 如 H.265/MPEG-2).
+    /// 都失败 → nil 占位。
     private nonisolated static func videoCover(_ file: DashcamFile, thm: DashcamFile?) async -> UIImage? {
         if let thm, let image = await photoThumb(thm) { return image }
 
         if let headURL = try? await NovatekClient.shared.fetchHead(file, maxBytes: 1_500_000) {
-            if let image = await extractFrame(AVURLAsset(url: headURL)) {
+            if let image = FFmpegThumb.extractFrame(from: headURL) {
                 return image
             }
             try? FileManager.default.removeItem(at: headURL)
         }
 
         if let cachedFull = await NovatekClient.shared.cachedPreviewURL(for: file) {
-            if let image = await extractFrame(AVURLAsset(url: cachedFull)) {
+            if let image = FFmpegThumb.extractFrame(from: cachedFull) {
                 return image
             }
         }
         return nil
-    }
-
-    /// 用 AVAssetImageGenerator 从视频抽一帧 (iOS 解不出的编码返回 nil)
-    private nonisolated static func extractFrame(_ asset: AVURLAsset) async -> UIImage? {
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 640, height: 640)
-        generator.requestedTimeToleranceBefore = .positiveInfinity
-        generator.requestedTimeToleranceAfter = .positiveInfinity
-        guard let (cg, _) = try? await generator.image(at: .zero) else { return nil }
-        return UIImage(cgImage: cg)
     }
 }

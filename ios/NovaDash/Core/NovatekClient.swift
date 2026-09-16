@@ -148,9 +148,11 @@ actor NovatekClient {
 
     // MARK: - 拍照
 
-    /// 远程拍照: 优先直接拍(实测录像中也返回成功); -22(状态不允许)时
-    /// 降级为"切照片模式 → 拍照 → 切回视频模式".
-    /// 返回照片原始路径(A:\...), 为 nil 表示已接受但未返回路径(到相册确认).
+    /// 远程拍照 (iOS.md 五轮实测结论):
+    /// ① 直接 1001 —— 本机实测录像中也返回成功;
+    /// ② 返回 -22 才走模式切换连招: 切照片模式 → 拍照 → 切回视频 → **恢复录像**
+    ///    (最后一步必须做, 否则记录仪停在视频模式不再循环录像);
+    /// ③ 读超时 ≠ 失败: 命令可能已执行且不可重发, 返回 nil 引导用户到相册确认。
     func capturePhoto() async throws -> String? {
         do {
             let reply = try await request(cmd: 1001, timeout: 8)
@@ -160,10 +162,13 @@ actor NovatekClient {
             try? await Task.sleep(for: .seconds(1.5))
             let reply = try await request(cmd: 1001, timeout: 8)
             try? await send(3001, par: 0, timeout: 12)   // 切回视频模式
+            _ = try? await send(2001, str: "1", timeout: 15)   // 恢复录像
             guard reply.response.status == 0 else {
                 throw NovatekError.deviceStatus(reply.response.status ?? -1)
             }
             return reply.filePaths.first
+        } catch NovatekError.transport {
+            return nil   // 已接受但未确认, 由 UI 提示稍后到相册确认
         }
     }
 
@@ -173,18 +178,31 @@ actor NovatekClient {
         case started, stopped
         /// -22: 与当前状态重复, 语义化为"已处于目标状态", 不是错误
         case alreadyStarted, alreadyStopped
+        /// 读超时: 指令可能已生效但设备忙无法回执 (本机 2001 无参查询 -21, 无法远程确认)
+        case sentUnconfirmed
     }
 
-    /// 录像控制 (2001&str=1/0). 重命令, 超时 ≠ 失败 —— 调用方应捕获异常并提示稍后确认.
+    /// 录像控制 (2001&str=1/0). 读超时不重发, 轮询心跳等设备恢复后返回 sentUnconfirmed.
     func setRecording(_ on: Bool) async throws -> RecordOutcome {
-        let reply = try await request(cmd: 2001, str: on ? "1" : "0", timeout: 15)
-        switch reply.response.status {
-        case 0:
-            return on ? .started : .stopped
-        case -22:
-            return on ? .alreadyStarted : .alreadyStopped
-        default:
-            throw NovatekError.deviceStatus(reply.response.status ?? -1)
+        do {
+            let reply = try await request(cmd: 2001, str: on ? "1" : "0", timeout: 15)
+            switch reply.response.status {
+            case 0:
+                return on ? .started : .stopped
+            case -22:
+                return on ? .alreadyStarted : .alreadyStopped
+            default:
+                throw NovatekError.deviceStatus(reply.response.status ?? -1)
+            }
+        } catch NovatekError.transport {
+            // 超时 ≠ 失败: 只等设备恢复 (心跳), 绝不重发 2001, 防止请求风暴
+            var waited: TimeInterval = 0
+            while waited < 30 {
+                try? await Task.sleep(for: .seconds(2))
+                waited += 2
+                if await ping() { return .sentUnconfirmed }
+            }
+            return .sentUnconfirmed
         }
     }
 
@@ -279,6 +297,11 @@ actor NovatekClient {
             url.appendPathComponent(String(segment))
         }
         return url
+    }
+
+    /// 相册在线播放用的流媒体地址 (FFmpeg 直接拉 HTTP-TS, 无需先下载)
+    func streamURL(for file: DashcamFile) -> URL {
+        remoteURL(of: file)
     }
 
     /// 逐段落盘 (hfs 服务器 Connection: close, 不复用连接), 期间持有串行通道.

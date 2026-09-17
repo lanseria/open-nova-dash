@@ -36,7 +36,7 @@
 
 ### Python 脚本
 
-依赖 [uv](https://docs.astral.sh/uv/) 管理（自动创建 .venv 并使用 Python 3.13）：
+全部通过 [uv](https://docs.astral.sh/uv/) 执行（**无需本机预装 Python**，uv 会按项目 `.python-version` 自动下载并管理 Python 3.13，自动创建 .venv 并安装依赖）：
 
 ```bash
 uv sync                    # 安装依赖

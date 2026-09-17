@@ -108,7 +108,7 @@ actor NovatekClient {
 
     // MARK: - 设备状态
 
-    /// 四个只读查询(3012/3024/3017/3019), 单项失败不影响其余
+    /// 五个只读查询(3012/3024/3017/3019/2016), 单项失败不影响其余
     func fetchDeviceStatus() async -> DeviceStatus {
         var status = DeviceStatus()
         if let reply = try? await request(cmd: 3012) {
@@ -123,6 +123,9 @@ actor NovatekClient {
         if let reply = try? await request(cmd: 3019) {
             status.battery = reply.response.value.flatMap { Int($0) }.flatMap(BatteryState.init)
         }
+        if let reply = try? await request(cmd: 2016) {
+            status.recordingSeconds = reply.response.value.flatMap { Int($0) }
+        }
         return status
     }
 
@@ -136,7 +139,7 @@ actor NovatekClient {
             try? await send(3001, par: 2, timeout: 12)   // 切回放模式
             try? await Task.sleep(for: .seconds(2))
             let files = try await fetchFilesDirect()
-            try? await send(3001, par: 0, timeout: 12)   // 切回视频模式
+            try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (2026-09 实测: par=1=录像)
             return files
         }
     }
@@ -148,20 +151,20 @@ actor NovatekClient {
 
     // MARK: - 拍照
 
-    /// 远程拍照 (iOS.md 五轮实测结论):
+    /// 远程拍照 (2026-09-17 模式校准后):
     /// ① 直接 1001 —— 本机实测录像中也返回成功;
-    /// ② 返回 -22 才走模式切换连招: 切照片模式 → 拍照 → 切回视频 → **恢复录像**
-    ///    (最后一步必须做, 否则记录仪停在视频模式不再循环录像);
+    /// ② 返回 -22 才走模式切换连招: 切照片模式(**par=0**, 设备 3037 回报 4) → 拍照 →
+    ///    切回录像模式(**par=1**, 3037=1) → **恢复录像**(最后一步必须做);
     /// ③ 读超时 ≠ 失败: 命令可能已执行且不可重发, 返回 nil 引导用户到相册确认。
     func capturePhoto() async throws -> String? {
         do {
             let reply = try await request(cmd: 1001, timeout: 8)
             return reply.filePaths.first
         } catch NovatekError.deviceStatus(-22) {
-            try await send(3001, par: 1, timeout: 12)    // 切照片模式
+            try await send(3001, par: 0, timeout: 12)    // 切照片模式 (实测 par=0=照片, 3037=4)
             try? await Task.sleep(for: .seconds(1.5))
             let reply = try await request(cmd: 1001, timeout: 8)
-            try? await send(3001, par: 0, timeout: 12)   // 切回视频模式
+            try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (实测 par=1=录像, 3037=1)
             _ = try? await send(2001, str: "1", timeout: 15)   // 恢复录像
             guard reply.response.status == 0 else {
                 throw NovatekError.deviceStatus(reply.response.status ?? -1)

@@ -56,6 +56,15 @@ struct DashboardView: View {
             List {
                 Section {
                     row("固件版本", value: model.status.firmware, icon: "cpu")
+                    row(
+                        "录像状态",
+                        value: model.status.recordingText ?? "未知",
+                        icon: model.status.recordingSeconds == nil
+                            ? "questionmark.circle" : "record.circle"
+                    )
+                    .foregroundStyle(
+                        (model.status.recordingSeconds ?? 0) > 0 ? Color.primary : Color.orange
+                    )
                     row("电池", value: model.status.battery?.label ?? "未知", icon: "battery.100")
                     row("SD 卡", value: model.status.sdCard?.label ?? "未知", icon: "sdcard")
                     row("剩余空间", value: model.status.freeSpaceText, icon: "externaldrive")

@@ -47,10 +47,16 @@ struct DeviceStatus: Sendable {
     var battery: BatteryState?
     var sdCard: SDCardState?
     var freeBytes: Int64?
+    /// cmd 2016 当前录像片段秒数: nil=查询失败, 0=未录像, >0=录像中
+    var recordingSeconds: Int?
 
     var freeSpaceText: String {
         guard let freeBytes else { return "未知" }
         return ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file)
+    }
+
+    var recordingText: String? {
+        recordingSeconds.map { $0 > 0 ? "录像中 (\($0)s)" : "未录像" }
     }
 }
 

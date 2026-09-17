@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from .control import recording_seconds
+
 BATTERY_LABELS = {0: "满", 1: "中", 2: "低", 3: "耗尽", 5: "充电中"}
 SD_LABELS = {0: "无卡", 1: "正常", 2: "被锁定"}
 
@@ -19,6 +21,14 @@ def page_status(client) -> None:
     firmware = root.findtext("String") if root is not None else None
     if firmware:
         print(f"  🔖 固件: {firmware}")
+
+    # 录像状态 (2016: 当前片段秒数, 0=未录像)
+    seconds = recording_seconds(client)
+    if seconds is not None:
+        print(f"  🔴 录像状态: {'录像中' if seconds > 0 else '未录像'}"
+              + (f" (当前片段 {seconds}s)" if seconds > 0 else ""))
+        if seconds == 0:
+            print("  ⚠️ 设备未在录像! 行车记录仪应保持循环录像, 可用 control --record on 恢复")
 
     # SD 卡状态
     root = client.send_cmd(3024, description="SD 卡状态 (0=无卡 1=正常 2=被锁定)")

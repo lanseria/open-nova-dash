@@ -11,6 +11,8 @@
     uv run script.py control --live       # 控制页: RTSP 直播节点
     uv run script.py control --format-sd  # 控制页: 格式化 SD 卡 (需输入 yes)
     uv run script.py all                  # 完整回归: 状态 → 相册 → 拍照 → 录像
+    uv run script.py probe                # 慢速探针: 逐一验证 停录→开录→拍照 (排查 iOS 无效果)
+    uv run script.py probe --ops capture --delay 5   # 只测拍照, 命令前静置 5s
     (兼容 v6: uv run script.py --format-sd 等价于 control --format-sd)
 
 所有页面都先连接设备(3 次探测)并启动 3s 心跳, 结束自动停止 --
@@ -23,9 +25,9 @@ import argparse
 import sys
 import time
 
-from nova_dash import album, connection, control, core, dashboard
+from nova_dash import album, connection, control, core, dashboard, probe
 
-SUBCOMMANDS = ("all", "album", "connect", "control", "status")
+SUBCOMMANDS = ("all", "album", "connect", "control", "probe", "status")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -45,6 +47,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--live", action="store_true", help="control: 打印 RTSP 直播节点")
     parser.add_argument("--format-sd", action="store_true",
                         help="control: 格式化 SD 卡 (危险操作, 需输入 yes 确认)")
+    parser.add_argument("--ops", default=probe.DEFAULT_OPS, metavar="stop,start,capture",
+                        help="probe: 选择要验证的操作, 逗号分隔 (默认全部)")
+    parser.add_argument("--delay", type=float, default=3.0, metavar="秒",
+                        help="probe: 每条控制命令前的静置秒数 (默认 3, 急躁设备可加到 5~8)")
+    parser.add_argument("--verify-timeout", type=float, default=25.0, metavar="秒",
+                        help="probe: 命令后轮询 2016 复核真实状态的窗口 (默认 25)")
     return parser.parse_args(argv)
 
 
@@ -89,6 +97,16 @@ def main() -> None:
             album.page_album(client, args.download)
         elif args.page == "control":
             control.page_control(client, args)
+        elif args.page == "probe":
+            wanted = [o.strip() for o in dict.fromkeys(args.ops.split(","))]
+            unknown = [o for o in wanted if o and o not in probe.OP_CHOICES]
+            if unknown:
+                print(f"⚠️ 忽略未知操作: {', '.join(unknown)} (可选: {', '.join(probe.OP_CHOICES)})")
+            ops = [o for o in wanted if o in probe.OP_CHOICES]
+            if not ops:
+                print("❌ 没有可运行的探针操作")
+                sys.exit(1)
+            probe.run_probe(client, ops, args.delay, args.verify_timeout)
         elif args.page == "all":
             run_all(client)
     finally:

@@ -123,6 +123,9 @@ A:\CARDV\MOVIE\x.TS  →  http://192.168.1.254/CARDV/MOVIE/x.TS
 
 脚本入口：`uv run script.py control --capture | --record on|off | --format-sd`
 
+排查 iOS 端"拍照/停录/开录没效果"用慢速探针：`uv run script.py probe [--ops stop,start,capture] [--delay 5]`
+（命令前静置、全程时间戳、每步用 2016/1003 复核真实效果，结论判读见脚本输出。）
+
 | cmd | 参数 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | 3001 | `par=0/1/2` | ✅ | 切换工作模式。**枚举两说冲突（官方 0=照片/1=录像 vs 本机早期记录 0=视频/1=拍照），以 3037 校准为准**。本机切模式后不会自动恢复录像，必须收尾补 `2001&str=1` |

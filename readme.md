@@ -26,6 +26,7 @@
 - `status` 状态仪表盘（固件版本/电池/SD 卡/剩余空间）
 - `album` 文件列表，`--download 关键字` 按文件名子串下载到 `./downloads/`
 - `control` 拍照（安全连招）/ 录像开关 / RTSP 节点 / SD 卡格式化（二次确认）
+- `probe` 慢速控制探针：逐一验证 停录→开录→拍照，命令前静置、全程时间戳、用 2016/1003 复核真实效果（排查 iOS 端"点了没反应"）
 - 内置串行锁 + 心跳退避，规避记录仪 HTTP 服务的并发红线
 
 ## 快速开始
@@ -87,7 +88,8 @@ open-nova-dash/
 │   ├── connection.py          # 连接探测 + 心跳保活
 │   ├── dashboard.py           # 状态仪表盘
 │   ├── album.py               # 文件列表 + 下载
-│   └── control.py             # 拍照/录像/直播节点/格式化
+│   ├── control.py             # 拍照/录像/直播节点/格式化
+│   └── probe.py               # 慢速控制探针（排查 iOS 控制无效果）
 ├── pyproject.toml         # Python 项目配置
 ├── novatek-protocol.md    # 联咏 Wi-Fi CGI 协议（当前硬件实测版）
 ├── iOS.md                 # iOS 端实现设计与协议实测记录

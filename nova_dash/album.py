@@ -33,7 +33,7 @@ def fetch_file_list(client) -> list[str]:
     time.sleep(2)
     root = client.send_cmd(3015, description="回放模式下查询文件列表", timeout=12)
     paths = parse_file_list(root) or []
-    client.send_cmd(3001, par=0, description="切回视频模式", timeout=12)
+    client.send_cmd(3001, par=1, description="切回录像模式 (par=1, 2026-09-17 校准)", timeout=12)
     time.sleep(3)
     if not paths:
         print("  ⚠️ 未取到文件, 请结合状态页 SD 卡信息排查")

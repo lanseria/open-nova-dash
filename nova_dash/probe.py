@@ -1,6 +1,6 @@
 """慢速控制探针 (排查 iOS 控制页"拍照/停录/开录没效果").
 
-与 iOS 端发完全相同的命令 (1001 / 2001&str= / 3001&par=), 但节奏放慢、逐步取证:
+与 iOS 端发完全相同的命令 (1001 / 2001&par= / 3001&par=), 但节奏放慢、逐步取证:
 1. 每条控制命令前静置 --delay 秒 (默认 3s), 排除"发太快, 设备来不及处理";
 2. 全程 [HH:MM:SS] 时间戳, 便于与设备表现/iOS 端日志对时;
 3. 不信命令回执, 每步用权威状态命令复核真实效果:
@@ -130,14 +130,14 @@ def verdict(op: str, sent_ok: bool | None, achieved: bool) -> str:
 
 def probe_stop(client, delay: float, verify_timeout: float) -> str:
     print("\n" + "=" * 46)
-    print(" 探针①: 停止录像 (cmd=2001&str=0)")
+    print(" 探针①: 停止录像 (cmd=2001&par=0)")
     print("=" * 46)
     log("前置复核: 当前是否真的在录像")
     if is_recording(client) is not True:
         log("⏭ 设备本就未在录像, 停止无对象 (iOS 会提示'设备本就已停止')")
         return "⏭ 跳过 (未在录像)"
     settle(delay, "给设备留出收尾/腾挪时间")
-    root = timed_cmd(client, 2001, str_par=0, timeout=15, label="停止录像 (2001&str=0)")
+    root = timed_cmd(client, 2001, par=0, timeout=15, label="停止录像 (2001&par=0)")
     settle(1.0, "等设备落盘收尾")
     log(f"轮询 2016 复核真实状态 (窗口 {verify_timeout:g}s)...")
     state = poll_recording(client, target=False, timeout=verify_timeout)
@@ -146,14 +146,14 @@ def probe_stop(client, delay: float, verify_timeout: float) -> str:
 
 def probe_start(client, delay: float, verify_timeout: float) -> str:
     print("\n" + "=" * 46)
-    print(" 探针②: 开始录像 (cmd=2001&str=1)")
+    print(" 探针②: 开始录像 (cmd=2001&par=1)")
     print("=" * 46)
     log("前置复核: 当前是否真的未录像")
     if is_recording(client) is True:
         log("⏭ 设备已在录像中, 开始无对象 (iOS 会提示'设备本就在录像中')")
         return "⏭ 跳过 (已在录像)"
     settle(delay, "停录后立即开录会长时间阻塞, 必须留恢复时间")
-    root = timed_cmd(client, 2001, str_par=1, timeout=15, label="开始录像 (2001&str=1)")
+    root = timed_cmd(client, 2001, par=1, timeout=15, label="开始录像 (2001&par=1)")
     if root is None:
         log("   命令无回执 (读超时≠失败), 以轮询结果为准")
     settle(1.0, "等设备启动编码")
@@ -196,7 +196,7 @@ def probe_capture(client, delay: float, verify_timeout: float) -> str:
         settle(1.5, "等照片落盘")
         timed_cmd(client, 3001, par=1, timeout=12, label="切回录像模式 (3001&par=1)")
         settle(2.5, "等模式稳定")
-        timed_cmd(client, 2001, str_par=1, timeout=15, label="恢复录像 (2001&str=1)")
+        timed_cmd(client, 2001, par=1, timeout=15, label="恢复录像 (2001&par=1)")
 
     settle(1.5, "等写卡彻底完成再复核")
     after = remaining_photos(client)
@@ -223,7 +223,7 @@ def ensure_recording(client, delay: float, verify_timeout: float) -> None:
         log("✅ 设备仍在录像, 无需处理")
         return
     settle(delay, "收尾恢复前静置")
-    timed_cmd(client, 2001, str_par=1, timeout=15, label="恢复循环录像 (2001&str=1)")
+    timed_cmd(client, 2001, par=1, timeout=15, label="恢复循环录像 (2001&par=1)")
     state = poll_recording(client, target=True, timeout=verify_timeout)
     if state is not True:
         log("❌ 未能确认恢复录像! 请查看设备屏幕或断电重启")

@@ -2,7 +2,7 @@
 
 拍照/录像/直播节点/SD 卡格式化. 安全连招与 iOS ControlModel 一致:
 - 拍照: 直接 1001, 失败(-22)再走 模式切换连招, 收尾必恢复录像
-- 录像: 2001 只认 str= 传参; 超时不重发, 等设备恢复后按需补发
+- 录像: 2001 只认 par= 传参 (2026-09-18 扫描台定稿, str= 无效果); 超时不重发
 """
 
 from __future__ import annotations
@@ -52,11 +52,11 @@ def capture(client) -> None:
 
     client.send_cmd(3001, par=1, description="切回录像模式 (par=1, 实测=录像)", timeout=12)
     time.sleep(3)
-    # 本机切模式不会自动恢复循环录像, 收尾必须补 2001&str=1;
+    # 本机切模式不会自动恢复循环录像, 收尾必须补 2001&par=1;
     # 超时只等恢复, 恢复后补发一次是安全的 (-22 = 已在录像, 无副作用)
-    root = client.send_cmd(2001, str_par=1, description="恢复录像 (收尾)", timeout=15)
+    root = client.send_cmd(2001, par=1, description="恢复录像 (收尾, par=1)", timeout=15)
     if root is None and client.wait_device_back(60, "设备无响应, 等待恢复"):
-        client.send_cmd(2001, str_par=1, description="补发恢复录像 (str=1)", timeout=15)
+        client.send_cmd(2001, par=1, description="补发恢复录像 (par=1)", timeout=15)
     seconds = recording_seconds(client)
     if seconds is not None and seconds > 0:
         print(f"  ✅ 已恢复录像 (2016={seconds}s)")
@@ -65,8 +65,8 @@ def capture(client) -> None:
 def set_record(client, on: bool) -> bool:
     action = "开始" if on else "停止"
     root = client.send_cmd(
-        2001, str_par=int(on),
-        description=f"{action}录像 (str={int(on)}; -22=已在目标状态)", timeout=15,
+        2001, par=int(on),
+        description=f"{action}录像 (par={int(on)}; -22=已在目标状态)", timeout=15,
     )
     if is_ok(root):
         print(f"  ✅ 已{action}录像")

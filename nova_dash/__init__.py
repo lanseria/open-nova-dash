@@ -7,4 +7,5 @@
 - album.py      <-> 相册页 AlbumView.swift       (文件列表/下载)
 - control.py    <-> 控制页 ControlView.swift     (拍照/录像/直播节点/格式化)
 - probe.py      <-> 控制页诊断探针               (慢速节奏验证拍照/录像命令, 排查 iOS 无效果)
+- sweep.py      <-> 控制页指令扫描台             (逐条试射候选命令码, 以设备提示音/屏幕为判据)
 """

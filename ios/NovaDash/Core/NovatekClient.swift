@@ -154,7 +154,7 @@ actor NovatekClient {
     /// 远程拍照 (2026-09-17 模式校准后):
     /// ① 直接 1001 —— 本机实测录像中也返回成功;
     /// ② 返回 -22 才走模式切换连招: 切照片模式(**par=0**, 设备 3037 回报 4) → 拍照 →
-    ///    切回录像模式(**par=1**, 3037=1) → **恢复录像**(最后一步必须做);
+    ///    切回录像模式(**par=1**, 3037=1) → **恢复录像**(最后一步必须做, 2001 只认 par=);
     /// ③ 读超时 ≠ 失败: 命令可能已执行且不可重发, 返回 nil 引导用户到相册确认。
     func capturePhoto() async throws -> String? {
         do {
@@ -165,7 +165,7 @@ actor NovatekClient {
             try? await Task.sleep(for: .seconds(1.5))
             let reply = try await request(cmd: 1001, timeout: 8)
             try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (实测 par=1=录像, 3037=1)
-            _ = try? await send(2001, str: "1", timeout: 15)   // 恢复录像
+            _ = try? await send(2001, par: 1, timeout: 15)   // 恢复录像 (2026-09-18 实测只认 par=)
             guard reply.response.status == 0 else {
                 throw NovatekError.deviceStatus(reply.response.status ?? -1)
             }
@@ -185,10 +185,11 @@ actor NovatekClient {
         case sentUnconfirmed
     }
 
-    /// 录像控制 (2001&str=1/0). 读超时不重发, 轮询心跳等设备恢复后返回 sentUnconfirmed.
+    /// 录像控制 (2001&par=1/0, 2026-09-18 扫描台实测定稿: 本机只认 par=, str= 无效果).
+    /// 读超时不重发, 轮询心跳等设备恢复后返回 sentUnconfirmed.
     func setRecording(_ on: Bool) async throws -> RecordOutcome {
         do {
-            let reply = try await request(cmd: 2001, str: on ? "1" : "0", timeout: 15)
+            let reply = try await request(cmd: 2001, par: on ? 1 : 0, timeout: 15)
             switch reply.response.status {
             case 0:
                 return on ? .started : .stopped

@@ -13,6 +13,10 @@
     uv run script.py all                  # 完整回归: 状态 → 相册 → 拍照 → 录像
     uv run script.py probe                # 慢速探针: 逐一验证 停录→开录→拍照 (排查 iOS 无效果)
     uv run script.py probe --ops capture --delay 5   # 只测拍照, 命令前静置 5s
+    uv run script.py try                  # 指令扫描台: 逐条试射候选命令, 听提示音判断设备认哪条
+    uv run script.py try --all            # 扫描台自动连发全部候选 (条目间停 4s)
+    uv run script.py try --capture        # 拍照组合实验: 按模式×命令连发, 自动验证落盘
+    uv run script.py try --cmd 2001 --par 1   # 单发任意命令 (8005/8020 等厂商命令也走这里)
     (兼容 v6: uv run script.py --format-sd 等价于 control --format-sd)
 
 所有页面都先连接设备(3 次探测)并启动 3s 心跳, 结束自动停止 --
@@ -25,9 +29,9 @@ import argparse
 import sys
 import time
 
-from nova_dash import album, connection, control, core, dashboard, probe
+from nova_dash import album, connection, control, core, dashboard, probe, sweep
 
-SUBCOMMANDS = ("all", "album", "connect", "control", "probe", "status")
+SUBCOMMANDS = ("all", "album", "connect", "control", "probe", "status", "try")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -53,6 +57,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="probe: 每条控制命令前的静置秒数 (默认 3, 急躁设备可加到 5~8)")
     parser.add_argument("--verify-timeout", type=float, default=25.0, metavar="秒",
                         help="probe: 命令后轮询 2016 复核真实状态的窗口 (默认 25)")
+    parser.add_argument("--cmd", type=int, metavar="N",
+                        help="try: 单发指定命令号 (危险命令会要求二次确认)")
+    parser.add_argument("--par", type=int, metavar="N", help="try: 配合 --cmd 的 par 参数")
+    parser.add_argument("--str", dest="str_par", metavar="S", help="try: 配合 --cmd 的 str 参数")
+    parser.add_argument("--all", action="store_true", help="try: 自动连发全部候选命令")
+    parser.add_argument("--capture", action="store_true",
+                        help="try: 连发拍照组合实验 (模式×命令, 自动验证照片落盘)")
+    parser.add_argument("--gap", type=float, default=4.0, metavar="秒",
+                        help="try: 自动连发的条目间隔 (默认 4, 给听提示音留时间)")
+    parser.add_argument("--list", action="store_true", help="try: 只打印候选命令清单")
     return parser.parse_args(argv)
 
 
@@ -107,6 +121,8 @@ def main() -> None:
                 print("❌ 没有可运行的探针操作")
                 sys.exit(1)
             probe.run_probe(client, ops, args.delay, args.verify_timeout)
+        elif args.page == "try":
+            sweep.page_try(client, args)
         elif args.page == "all":
             run_all(client)
     finally:

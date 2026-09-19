@@ -16,3 +16,4 @@ xcuserdata/
 *.xcuserdatad/
 DerivedData/
 .DS_Store
+thumbs/*.jpg

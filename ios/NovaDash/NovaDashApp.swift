@@ -26,16 +26,16 @@ struct ContentView: View {
     }
 }
 
-/// 三个功能页仅在连接成功后出现
+/// 连接成功后的两个功能页:
+/// ① 控制首页 (直播/录像/拍照 + 相册入口, 相册仅在停止录像后开放);
+/// ② 状态仪表盘。
 struct MainTabView: View {
     var body: some View {
         TabView {
-            DashboardView()
-                .tabItem { Label("状态", systemImage: "gauge") }
-            AlbumView()
-                .tabItem { Label("相册", systemImage: "photo.on.rectangle.angled") }
             ControlView()
                 .tabItem { Label("控制", systemImage: "camera.fill") }
+            DashboardView()
+                .tabItem { Label("状态", systemImage: "gauge") }
         }
     }
 }

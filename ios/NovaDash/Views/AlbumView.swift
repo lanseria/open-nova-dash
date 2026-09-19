@@ -122,52 +122,51 @@ struct AlbumView: View {
     @State private var streamingFile: DashcamFile?
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                LazyVStack(spacing: 16, pinnedViews: .sectionHeaders) {
-                    filterBar
+        // 由控制页 push 进入 (外层已有 NavigationStack, 此处不再嵌套)
+        ScrollView {
+            LazyVStack(spacing: 16, pinnedViews: .sectionHeaders) {
+                filterBar
 
-                    if let error = model.errorText {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.red)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal)
-                    }
+                if let error = model.errorText {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal)
+                }
 
-                    ForEach(model.groups) { group in
-                        Section {
-                            grid(group)
-                        } header: {
-                            sectionHeader(group)
-                        }
+                ForEach(model.groups) { group in
+                    Section {
+                        grid(group)
+                    } header: {
+                        sectionHeader(group)
                     }
                 }
-                .padding(.vertical, 8)
             }
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("相册")
-            .refreshable { await model.load(force: true) }
-            .task { await model.load() }
-            .overlay {
-                if model.isLoading && model.files.isEmpty {
-                    ProgressView("正在拉取文件列表…")
-                        .padding()
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                }
+            .padding(.vertical, 8)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("相册")
+        .refreshable { await model.load(force: true) }
+        .task { await model.load() }
+        .overlay {
+            if model.isLoading && model.files.isEmpty {
+                ProgressView("正在拉取文件列表…")
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
-            .overlay(alignment: .bottom) {
-                toast
-            }
-            .sheet(item: $viewerGroup) { group in
-                PhotoViewer(model: model, photos: group.files)
-                    .presentationDragIndicator(.visible)
-                    .presentationBackground(.black)
-            }
-            .sheet(item: $streamingFile) { file in
-                VideoStreamSheet(file: file)
-                    .presentationDragIndicator(.visible)
-                    .presentationBackground(.black)
-            }
+        }
+        .overlay(alignment: .bottom) {
+            toast
+        }
+        .sheet(item: $viewerGroup) { group in
+            PhotoViewer(model: model, photos: group.files)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(.black)
+        }
+        .sheet(item: $streamingFile) { file in
+            VideoStreamSheet(file: file)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(.black)
         }
     }
 

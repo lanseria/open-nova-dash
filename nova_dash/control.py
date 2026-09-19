@@ -27,20 +27,14 @@ def recording_seconds(client) -> int | None:
 
 
 def capture(client) -> None:
-    """拍照: 与 iOS 相同的安全连招, 避免让记录仪停在非录像状态.
+    """拍照: 2026-09-19 定稿连招 (照片模式直拍), 收尾必恢复录像.
 
+    录像中直接 1001 无效果; 2017/2018 两步抓拍同样无效 (扫描台实测).
     模式枚举 2026-09-17 实测校准 (3037 回报): par=0=照片(3037=4), par=1=录像(3037=1), par=2=回放(3037=3).
     """
-    root = client.send_cmd(1001, description="直接拍照", timeout=6)
-    fpath = extract_fpath(root)
-    if is_ok(root) or fpath:
-        print(f"  📷 照片已保存: {fpath}" if fpath else "  ✅ 拍照成功")
-        return
-
-    print("  → 直接拍照失败, 走模式切换连招: 照片模式(par=0) → 拍照 → 录像模式(par=1) → 恢复录像")
     client.send_cmd(3001, par=0, description="切换到照片模式 (par=0, 实测=照片)", timeout=12)
     time.sleep(2)
-    root = client.send_cmd(1001, description="执行拍照 (cmd=1001)", timeout=6)
+    root = client.send_cmd(1001, description="照片模式下拍照 (cmd=1001)", timeout=8)
     fpath = extract_fpath(root)
     if fpath:
         print(f"  📷 照片已保存: {fpath}")

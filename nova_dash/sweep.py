@@ -300,7 +300,7 @@ def page_try(client, args) -> None:
     if args.cmd is not None:
         single(client, args.cmd, args.par, args.str_par)
         return
-    if getattr(args, "capture", False):
+    if getattr(args, "capture_lab", False):
         auto_capture(client)
         return
     if args.all:

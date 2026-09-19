@@ -15,8 +15,10 @@
     uv run script.py probe --ops capture --delay 5   # 只测拍照, 命令前静置 5s
     uv run script.py try                  # 指令扫描台: 逐条试射候选命令, 听提示音判断设备认哪条
     uv run script.py try --all            # 扫描台自动连发全部候选 (条目间停 4s)
-    uv run script.py try --capture        # 拍照组合实验: 按模式×命令连发, 自动验证落盘
+    uv run script.py try --capture-lab    # 拍照组合实验: 按模式×命令连发, 自动验证落盘
     uv run script.py try --cmd 2001 --par 1   # 单发任意命令 (8005/8020 等厂商命令也走这里)
+    uv run script.py thumb                # 原生视频封面探测: 4001/4002/?4001/.THM 逐一试, 命中存图
+    uv run script.py thumb --file 'A:\\CARDV\\MOVIE\\x.TS' --out thumbs  # 指定样本与输出目录
     (兼容 v6: uv run script.py --format-sd 等价于 control --format-sd)
 
 所有页面都先连接设备(3 次探测)并启动 3s 心跳, 结束自动停止 --
@@ -29,9 +31,9 @@ import argparse
 import sys
 import time
 
-from nova_dash import album, connection, control, core, dashboard, probe, sweep
+from nova_dash import album, connection, control, core, dashboard, probe, sweep, thumb
 
-SUBCOMMANDS = ("all", "album", "connect", "control", "probe", "status", "try")
+SUBCOMMANDS = ("all", "album", "connect", "control", "probe", "status", "thumb", "try")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -62,11 +64,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--par", type=int, metavar="N", help="try: 配合 --cmd 的 par 参数")
     parser.add_argument("--str", dest="str_par", metavar="S", help="try: 配合 --cmd 的 str 参数")
     parser.add_argument("--all", action="store_true", help="try: 自动连发全部候选命令")
-    parser.add_argument("--capture", action="store_true",
+    parser.add_argument("--capture-lab", action="store_true",
                         help="try: 连发拍照组合实验 (模式×命令, 自动验证照片落盘)")
     parser.add_argument("--gap", type=float, default=4.0, metavar="秒",
                         help="try: 自动连发的条目间隔 (默认 4, 给听提示音留时间)")
     parser.add_argument("--list", action="store_true", help="try: 只打印候选命令清单")
+    parser.add_argument("--file", metavar="路径",
+                        help="thumb: 指定样本视频的设备路径 (默认自动选最新一段录像)")
+    parser.add_argument("--out", default="thumbs", metavar="目录",
+                        help="thumb: 命中图片的保存目录 (默认 ./thumbs)")
     return parser.parse_args(argv)
 
 
@@ -123,6 +129,8 @@ def main() -> None:
             probe.run_probe(client, ops, args.delay, args.verify_timeout)
         elif args.page == "try":
             sweep.page_try(client, args)
+        elif args.page == "thumb":
+            thumb.page_thumb(client, args)
         elif args.page == "all":
             run_all(client)
     finally:

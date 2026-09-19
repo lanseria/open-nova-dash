@@ -20,11 +20,16 @@ final class ConnectionModel {
 
     private(set) var state: State = .disconnected
     private(set) var lastHeartbeatAt: Date?
+    /// cmd 2016 当前录像片段秒数, 跟随心跳每轮查询: nil=未知, 0=未录像, >0=录像中
+    private(set) var recordingSeconds: Int?
     var errorText: String?
 
     private var monitorTask: Task<Void, Never>?
 
     var isConnected: Bool { state == .connected }
+
+    /// 当前是否在录像: nil = 尚未取得过状态 (控制页据此决定开/停按钮与相册入口)
+    var isRecording: Bool? { recordingSeconds.map { $0 > 0 } }
 
     /// 手动连接: 探测通过后进入心跳监控
     func connect() async {
@@ -53,7 +58,13 @@ final class ConnectionModel {
     func disconnect() {
         stopMonitoring()
         lastHeartbeatAt = nil
+        recordingSeconds = nil
         state = .disconnected
+    }
+
+    /// 控制命令执行后立即复核录像状态 (不等下一轮心跳)
+    func refreshRecording() async {
+        recordingSeconds = await NovatekClient.shared.fetchRecordingSeconds()
     }
 
     private func startMonitoring() {
@@ -68,6 +79,8 @@ final class ConnectionModel {
                 if await NovatekClient.shared.ping() {
                     failures = 0
                     self.lastHeartbeatAt = Date()
+                    // 跟随心跳顺带查录像状态 (2016): 控制页据此展示"可停/可开"与相册入口
+                    self.recordingSeconds = await NovatekClient.shared.fetchRecordingSeconds()
                 } else {
                     failures += 1
                     if failures >= threshold {
@@ -87,6 +100,7 @@ final class ConnectionModel {
     private func handleLostConnection() {
         stopMonitoring()
         lastHeartbeatAt = nil
+        recordingSeconds = nil
         state = .disconnected
         errorText = "连接已断开, 请检查记录仪后重新连接"
     }

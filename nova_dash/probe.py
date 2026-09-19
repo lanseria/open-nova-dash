@@ -176,27 +176,22 @@ def probe_start(client, delay: float, verify_timeout: float) -> str:
 
 def probe_capture(client, delay: float, verify_timeout: float) -> str:
     print("\n" + "=" * 46)
-    print(" 探针③: 拍照 (cmd=1001, 失败再走慢速连招)")
+    print(" 探针③: 拍照 (2026-09-19 定稿: 照片模式直拍连招)")
     print("=" * 46)
     log("基线: 记录剩余可拍张数 (1003), 拍完后对比")
     before = remaining_photos(client)
     gap(0.8)
-    settle(delay, "拍照写卡耗时, 留足间隔")
-    root = timed_cmd(client, 1001, timeout=8, label="直接拍照 (1001)")
+    # 录像中直接 1001 无效果 (2026-09-19 扫描台实测), 直接走定稿连招
+    settle(delay, "切模式前静置")
+    timed_cmd(client, 3001, par=0, timeout=12, label="切换照片模式 (3001&par=0)")
+    settle(2.5, "等模式稳定")
+    root = timed_cmd(client, 1001, timeout=8, label="照片模式下拍照 (1001)")
     fpath = extract_fpath(root)
     status = root.findtext("Status") if root is not None else None
-
-    if status == "-22":
-        log("→ 回执 -22 (状态不允许), 走慢速模式切换连招 (与 iOS 同路径, 但步间静置)")
-        settle(delay, "切模式前静置")
-        timed_cmd(client, 3001, par=0, timeout=12, label="切换照片模式 (3001&par=0)")
-        settle(2.5, "等模式稳定")
-        root = timed_cmd(client, 1001, timeout=8, label="照片模式下拍照 (1001)")
-        fpath = extract_fpath(root) or fpath
-        settle(1.5, "等照片落盘")
-        timed_cmd(client, 3001, par=1, timeout=12, label="切回录像模式 (3001&par=1)")
-        settle(2.5, "等模式稳定")
-        timed_cmd(client, 2001, par=1, timeout=15, label="恢复录像 (2001&par=1)")
+    settle(1.5, "等照片落盘")
+    timed_cmd(client, 3001, par=1, timeout=12, label="切回录像模式 (3001&par=1)")
+    settle(2.5, "等模式稳定")
+    timed_cmd(client, 2001, par=1, timeout=15, label="恢复录像 (2001&par=1)")
 
     settle(1.5, "等写卡彻底完成再复核")
     after = remaining_photos(client)

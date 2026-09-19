@@ -108,6 +108,13 @@ actor NovatekClient {
 
     // MARK: - 设备状态
 
+    /// 单查 2016 当前录像片段秒数: nil=查询失败, 0=未录像, >0=录像中
+    /// (心跳跟随查询/控制命令后即时复核用, 比 fetchDeviceStatus 轻量)
+    func fetchRecordingSeconds() async -> Int? {
+        guard let reply = try? await request(cmd: 2016) else { return nil }
+        return reply.response.value.flatMap { Int($0) }
+    }
+
     /// 五个只读查询(3012/3024/3017/3019/2016), 单项失败不影响其余
     func fetchDeviceStatus() async -> DeviceStatus {
         var status = DeviceStatus()
@@ -151,28 +158,76 @@ actor NovatekClient {
 
     // MARK: - 拍照
 
-    /// 远程拍照 (2026-09-17 模式校准后):
-    /// ① 直接 1001 —— 本机实测录像中也返回成功;
-    /// ② 返回 -22 才走模式切换连招: 切照片模式(**par=0**, 设备 3037 回报 4) → 拍照 →
-    ///    切回录像模式(**par=1**, 3037=1) → **恢复录像**(最后一步必须做, 2001 只认 par=);
-    /// ③ 读超时 ≠ 失败: 命令可能已执行且不可重发, 返回 nil 引导用户到相册确认。
+    /// 远程拍照 (2026-09-19 扫描台定稿: 本机录像中直接 1001 无效果, 只认"照片模式直拍"):
+    /// ① 3001&par=0 切照片模式 (设备 3037 回报 4) → ② 1001 拍照 →
+    /// ③ 3001&par=1 切回录像模式 → ④ 2001&par=1 恢复录像 (最后一步必须做);
+    /// 中途出错仍尽力切回+恢复录像; 读超时 ≠ 失败 (可能已拍, 不可重发), 返回 nil 引导到相册确认。
     func capturePhoto() async throws -> String? {
         do {
+            try await send(3001, par: 0, timeout: 12)    // 切照片模式 (3037=4)
+            try? await Task.sleep(for: .seconds(2))
             let reply = try await request(cmd: 1001, timeout: 8)
-            return reply.filePaths.first
-        } catch NovatekError.deviceStatus(-22) {
-            try await send(3001, par: 0, timeout: 12)    // 切照片模式 (实测 par=0=照片, 3037=4)
+            let path = reply.filePaths.first
+            // 拍完无论成败都恢复行车状态 (切回录像模式 + 恢复循环录像)
+            try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (3037=1)
             try? await Task.sleep(for: .seconds(1.5))
-            let reply = try await request(cmd: 1001, timeout: 8)
-            try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (实测 par=1=录像, 3037=1)
-            _ = try? await send(2001, par: 1, timeout: 15)   // 恢复录像 (2026-09-18 实测只认 par=)
+            _ = try? await send(2001, par: 1, timeout: 15)   // 恢复录像 (本机只认 par=)
             guard reply.response.status == 0 else {
                 throw NovatekError.deviceStatus(reply.response.status ?? -1)
             }
-            return reply.filePaths.first
+            return path
         } catch NovatekError.transport {
-            return nil   // 已接受但未确认, 由 UI 提示稍后到相册确认
+            // 已进入照片模式后失联: 尽力恢复, 照片可能已拍, 由用户到相册确认
+            try? await send(3001, par: 1, timeout: 12)
+            try? await Task.sleep(for: .seconds(1.5))
+            _ = try? await send(2001, par: 1, timeout: 15)
+            return nil
         }
+    }
+
+    // MARK: - 原生视频封面
+
+    /// 设备原生缩略图 (2026-09-19 探测定稿): 下载 URL 追加 `?custom=1&cmd=4001`,
+    /// 固件直接返回内嵌 JPEG (实测约 28KB)。`?4001` 短形式与 CGI 4001/4002 本机均不支持。
+    /// 命中后写入预览缓存并返回文件 URL; 非图片/失败返回 nil (调用方回退 FFmpeg 抽帧)。
+    /// 低优先级排队, 不挡控制命令; 首字节校验 JPEG 魔数, 上限 512KB (防服务器忽略参数回吐整段视频)。
+    func fetchNativeThumbnail(for file: DashcamFile) async -> URL? {
+        let destination = previewDirectory.appendingPathComponent("native_" + file.name + ".jpg")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path),
+           let size = attrs[.size] as? Int64, size > 0 {
+            return destination
+        }
+        guard var components = URLComponents(url: remoteURL(of: file), resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.queryItems = [
+            URLQueryItem(name: "custom", value: "1"),
+            URLQueryItem(name: "cmd", value: "4001"),
+        ]
+        guard let thumbURL = components.url else { return nil }
+
+        await gate.wait(priority: .low)
+        defer { gate.signal() }
+        // bytes 流式读取: 首字节非 JPEG 魔数立即断开 (防服务器忽略参数回吐整段视频);
+        // 超时沿用 session 配置的 8s request timeout
+        guard let (bytes, response) = try? await session.bytes(from: thumbURL),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            return nil
+        }
+        var data = Data()
+        data.reserveCapacity(64 * 1024)
+        do {
+            for try await byte in bytes {
+                if data.isEmpty && byte != 0xFF { return nil }   // 非 JPEG 开头 (如 TS 的 0x47) → 不支持
+                data.append(byte)
+                if data.count >= 512 * 1024 { break }
+            }
+        } catch {
+            return nil
+        }
+        guard data.prefix(3) == Data([0xFF, 0xD8, 0xFF]) else { return nil }
+        try? data.write(to: destination)
+        return destination
     }
 
     // MARK: - 录像控制

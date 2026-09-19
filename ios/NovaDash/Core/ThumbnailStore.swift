@@ -68,25 +68,21 @@ final class ThumbnailStore {
 
     /// 照片: 下载原图到缓存 (预览时复用), 再用 ImageIO 降采样, 避免整图解码
     private nonisolated static func photoThumb(_ file: DashcamFile) async -> UIImage? {
-        guard let fullURL = try? await NovatekClient.shared.fetchPreviewFile(file),
-              let source = CGImageSourceCreateWithURL(fullURL as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 640,
-        ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return nil
-        }
-        return UIImage(cgImage: cg)
+        guard let fullURL = try? await NovatekClient.shared.fetchPreviewFile(file) else { return nil }
+        return downsample(fullURL)
     }
 
-    /// 视频封面多级兜底 (全部走 FFmpeg 解码, 支持 iOS 不认的 TS/H.265):
-    /// ① 设备端 .THM 伴生缩略图 (最准, 图小下载快);
-    /// ② 文件头部 1.5MB 抽帧 (FFmpeg 对截断文件容错良好);
-    /// ③ 已缓存完整文件抽帧 (不专门为封面触发大文件下载);
+    /// 视频封面多级兜底:
+    /// ① 设备原生缩略图 (下载 URL + ?custom=1&cmd=4001, 2026-09-19 实测: 直接返回约 28KB JPEG, 最快最省流量);
+    /// ② 设备端 .THM 伴生缩略图 (部分固件才有);
+    /// ③ 文件头部 1.5MB 抽帧 (FFmpeg 对截断文件容错良好);
+    /// ④ 已缓存完整文件抽帧 (不专门为封面触发大文件下载);
     /// 都失败 → nil 占位。
     private nonisolated static func videoCover(_ file: DashcamFile, thm: DashcamFile?) async -> UIImage? {
+        if let nativeURL = await NovatekClient.shared.fetchNativeThumbnail(for: file),
+           let image = downsample(nativeURL) {
+            return image
+        }
         if let thm, let image = await photoThumb(thm) { return image }
 
         if let headURL = try? await NovatekClient.shared.fetchHead(file, maxBytes: 1_500_000) {
@@ -102,5 +98,19 @@ final class ThumbnailStore {
             }
         }
         return nil
+    }
+
+    /// ImageIO 降采样读图 (封面场景无需整图解码)
+    private nonisolated static func downsample(_ url: URL, maxPixelSize: Int = 640) -> UIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: cg)
     }
 }

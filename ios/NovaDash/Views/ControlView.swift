@@ -20,9 +20,9 @@ final class ControlModel {
         busyText = nil
     }
 
-    /// 远程拍照 (2026-09-19 实测路径: 切照片模式 → 拍 → 自动切回并恢复录像), 完成后立即复核录像状态
+    /// 远程拍照 (实测路径: 切照片模式 → 拍 → 自动切回并恢复录像), 完成后立即复核录像状态
     func capture(connection: ConnectionModel) async {
-        await run("正在拍照… (切照片模式 → 拍 → 恢复录像, 约十几秒)") {
+        await run("正在拍照… (切照片模式 → 拍 → 恢复录像, 约十秒)") {
             let path = try await NovatekClient.shared.capturePhoto()
             await connection.refreshRecording()
             if let path {
@@ -55,7 +55,13 @@ struct ControlView: View {
     @Environment(ConnectionModel.self) private var connection
     @State private var model = ControlModel()
     @AppStorage("rtspURL") private var rtspURL = "rtsp://192.168.1.254/novatek/sub"
-    @StateObject private var liveCoordinator = KSVideoPlayer.Coordinator()
+    /// 直播会话专属 Coordinator: 每次开播换新实例。
+    /// KSPlayer 官方注释明确警告 —— 复用同一 Coordinator 时第二次 makeUIView 会先于
+    /// 上一次 dismantle 执行, 旧会话的 resetPlayer 会清掉新会话的播放器与回调,
+    /// 表现为"停止后无法再次播放"。用 @State 手动替换实例绕开该问题。
+    @State private var liveCoordinator = KSVideoPlayer.Coordinator()
+    /// 直播会话序号: 变化时强制重建播放器视图 (全新 KSPlayerLayer/RTSP 会话)
+    @State private var liveSession = 0
     @State private var isLiveOn = false
     @State private var liveStatus: String?
     @State private var liveError: String?
@@ -90,6 +96,7 @@ struct ControlView: View {
         Section {
             if isLiveOn, let liveURL = URL(string: rtspURL) {
                 KSVideoPlayer(coordinator: liveCoordinator, url: liveURL, options: makeLiveOptions())
+                    .id(liveSession)   // 会话身份强制重建, 隔离上一次会话的 dismantle 时序
                     .aspectRatio(16 / 9, contentMode: .fit)
                     .frame(maxWidth: .infinity)
                     .listRowInsets(EdgeInsets())
@@ -109,7 +116,7 @@ struct ControlView: View {
         } header: {
             Text("实时画面")
         } footer: {
-            Text("进入本页自动开始直播 (子码流低延迟)。直播时设备较忙, 其他操作响应会慢一些, 文件下载请回相册页进行。")
+            Text("进入本页自动开始直播 (子码流低延迟, 起播约 1~2 秒画面)。直播时设备较忙, 其他操作响应会慢一些, 文件下载请回相册页进行。")
         }
     }
 
@@ -126,13 +133,24 @@ struct ControlView: View {
                 }
             }
         } else if let liveError {
-            ZStack {
-                Color.black.opacity(0.5)
-                Label(liveError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.red)
+            // 点击即重试: 换全新播放会话重新开播
+            Button {
+                startLive()
+            } label: {
+                ZStack {
+                    Color.black.opacity(0.5)
+                    VStack(spacing: 6) {
+                        Label(liveError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                        Text("点击重试")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
                     .padding()
+                }
             }
+            .buttonStyle(.plain)
         }
     }
 
@@ -277,7 +295,11 @@ struct ControlView: View {
         guard url != rtspURL else { return }
         rtspURL = url
         stopLive()
-        startLive()
+        // 设备 RTSP 服务释放旧会话需要一点时间, 稍候再开新会话, 避免新旧会话撞车
+        Task {
+            try? await Task.sleep(for: .milliseconds(800))
+            startLive()
+        }
     }
 
     private func startLive() {
@@ -285,16 +307,29 @@ struct ControlView: View {
             liveError = "暂只支持 rtsp:// 地址"
             return
         }
+        // 全新播放会话: 新 Coordinator + 新视图身份, 规避 KSPlayer 会话复用导致的"停止后再开无效"
+        liveCoordinator = KSVideoPlayer.Coordinator()
+        liveSession += 1
         liveError = nil
         liveStatus = "连接中…"
         bindLiveCallbacks()
         isLiveOn = true
+        RequestConsole.shared.log(
+            kind: .event, title: "开始直播", detail: rtspURL, ok: true, result: "RTSP 会话发起"
+        )
     }
 
     private func stopLive() {
+        guard isLiveOn || liveStatus != nil || liveError != nil else { return }
         isLiveOn = false
         liveStatus = nil
+        // 先显式 stop(): shutdown 并立即断开 RTSP 会话 (设备端 RTSP 会话位有限,
+        // resetPlayer 内部只 pause 不释放, 旧会话挂着会导致下次开播被拒)
+        liveCoordinator.playerLayer?.stop()
         liveCoordinator.resetPlayer()
+        RequestConsole.shared.log(
+            kind: .event, title: "停止直播", detail: rtspURL, ok: true, result: "RTSP 会话关闭"
+        )
     }
 
     private func bindLiveCallbacks() {
@@ -327,6 +362,15 @@ struct ControlView: View {
         options.codecLowDelay = true
         options.isLoopPlay = false
         options.registerRemoteControll = false  // 不占用系统控制中心
+        // ↓ 三个默认值是 5 秒+ 直播延迟的主要来源, 针对直播全部调小:
+        // ① FFmpeg 默认探测流信息最长耗时 5s (5,000,000 微秒), 起播即带着这 5s 画面;
+        //   512KB/1s 对固定参数的记录仪子码流绰绰有余
+        options.probesize = 512 * 1024
+        options.maxAnalyzeDuration = 1_000_000  // 微秒 = 1s
+        // ② 默认缓冲 3s (存到一半 1.5s 才起播), 收到 0.5s 即起播
+        options.preferredForwardBufferDuration = 0.5
+        // ③ 默认最大缓存 30s —— 拉流快于播放时延迟越积越多; 收紧到 1.5s 封顶
+        options.maxBufferDuration = 1.5
         return options
     }
 

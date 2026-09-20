@@ -120,6 +120,9 @@ struct AlbumView: View {
     @State private var model = AlbumModel()
     @State private var viewerGroup: FileGroup?
     @State private var streamingFile: DashcamFile?
+    /// 播放会话序号: 每次点开视频都换新身份, 保证 VideoStreamSheet 拿到全新播放器
+    /// (规避 KSPlayer 复用会话导致的"停止后无法再次播放")
+    @State private var streamSession = 0
 
     var body: some View {
         // 由控制页 push 进入 (外层已有 NavigationStack, 此处不再嵌套)
@@ -165,6 +168,7 @@ struct AlbumView: View {
         }
         .sheet(item: $streamingFile) { file in
             VideoStreamSheet(file: file)
+                .id(streamSession)   // 每次打开都是全新会话 (新 Coordinator/播放器实例)
                 .presentationDragIndicator(.visible)
                 .presentationBackground(.black)
         }
@@ -260,7 +264,9 @@ struct AlbumView: View {
             let photos = (group?.files ?? [file]).filter { $0.kind == .photo }
             viewerGroup = FileGroup(day: file.day, files: photos.isEmpty ? [file] : photos)
         case .video:
-            // FFmpeg (KSPlayer) 直接拉设备的 HTTP-TS 流播放, 无需先下载
+            // FFmpeg (KSPlayer) 直接拉设备的 HTTP-TS 流播放, 无需先下载;
+            // 每次打开都换新播放会话, 防止旧会话残留导致同一路径无法重播
+            streamSession += 1
             streamingFile = file
         case .other:
             break
@@ -550,8 +556,16 @@ private struct VideoStreamSheet: View {
                 Task {
                     fileSize = await NovatekClient.shared.fetchFileSize(for: file)
                 }
+                RequestConsole.shared.log(
+                    kind: .event, title: "在线播放", detail: file.name, ok: true, result: "拉取 HTTP-TS 流"
+                )
             }
-            .onDisappear { coordinator.resetPlayer() }
+            .onDisappear {
+                // 先显式 stop() 立即断开 HTTP-TS 连接: 设备 HTTP 服务器单线程,
+                // resetPlayer 内部只 pause, 旧连接挂着会阻塞后续一切请求与重播
+                coordinator.playerLayer?.stop()
+                coordinator.resetPlayer()
+            }
         }
         .preferredColorScheme(.dark)
     }

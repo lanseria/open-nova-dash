@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D467691F305D6EB800756C18 /* Libavformat in Frameworks */ = {isa = PBXBuildFile; productRef = 1A2100000000000000000003 /* Libavformat */; };
+		D4676920305D6EB800756C18 /* Libavcodec in Frameworks */ = {isa = PBXBuildFile; productRef = 1A2100000000000000000004 /* Libavcodec */; };
+		D4676921305D6EB800756C18 /* Libavutil in Frameworks */ = {isa = PBXBuildFile; productRef = 1A2100000000000000000005 /* Libavutil */; };
+		D4676922305D6EB800756C18 /* Libswscale in Frameworks */ = {isa = PBXBuildFile; productRef = 1A2100000000000000000006 /* Libswscale */; };
 		D4D5D59D305A389300F396CE /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = 1A2100000000000000000001 /* KSPlayer */; };
 		D4D5D59E305A389300F396CE /* FFmpegKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1A2100000000000000000002 /* FFmpegKit */; };
 /* End PBXBuildFile section */
@@ -34,6 +38,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D4676922305D6EB800756C18 /* Libswscale in Frameworks */,
+				D4676921305D6EB800756C18 /* Libavutil in Frameworks */,
+				D4676920305D6EB800756C18 /* Libavcodec in Frameworks */,
+				D467691F305D6EB800756C18 /* Libavformat in Frameworks */,
 				D4D5D59E305A389300F396CE /* FFmpegKit in Frameworks */,
 				D4D5D59D305A389300F396CE /* KSPlayer in Frameworks */,
 			);
@@ -106,8 +114,8 @@
 			);
 			mainGroup = 1A1000000000000000000004;
 			packageReferences = (
-				1A2000000000000000000001 /* XCLocalSwiftPackageReference "KSPlayer" */,
-				1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */,
+				1A2000000000000000000001 /* XCLocalSwiftPackageReference "../../KSPlayer" */,
+				1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */,
 			);
 			projectDirPath = "";
 			projectRoot = "";
@@ -246,11 +254,11 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		1A2000000000000000000001 /* XCLocalSwiftPackageReference "KSPlayer" */ = {
+		1A2000000000000000000001 /* XCLocalSwiftPackageReference "../../KSPlayer" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../../KSPlayer;
 		};
-		1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */ = {
+		1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../../FFmpegKit;
 		};
@@ -259,32 +267,32 @@
 /* Begin XCSwiftPackageProductDependency section */
 		1A2100000000000000000001 /* KSPlayer */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 1A2000000000000000000001 /* XCLocalSwiftPackageReference "KSPlayer" */;
+			package = 1A2000000000000000000001 /* XCLocalSwiftPackageReference "../../KSPlayer" */;
 			productName = KSPlayer;
 		};
 		1A2100000000000000000002 /* FFmpegKit */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */;
+			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */;
 			productName = FFmpegKit;
 		};
 		1A2100000000000000000003 /* Libavformat */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */;
+			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */;
 			productName = Libavformat;
 		};
 		1A2100000000000000000004 /* Libavcodec */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */;
+			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */;
 			productName = Libavcodec;
 		};
 		1A2100000000000000000005 /* Libavutil */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */;
+			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */;
 			productName = Libavutil;
 		};
 		1A2100000000000000000006 /* Libswscale */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "FFmpegKit" */;
+			package = 1A2000000000000000000002 /* XCLocalSwiftPackageReference "../../FFmpegKit" */;
 			productName = Libswscale;
 		};
 /* End XCSwiftPackageProductDependency section */

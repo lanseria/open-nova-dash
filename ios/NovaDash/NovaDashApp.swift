@@ -26,9 +26,9 @@ struct ContentView: View {
     }
 }
 
-/// 连接成功后的两个功能页:
+/// 连接成功后的三个功能页:
 /// ① 控制首页 (直播/录像/拍照 + 相册入口, 相册仅在停止录像后开放);
-/// ② 状态仪表盘。
+/// ② 状态仪表盘; ③ 请求控制台 (排查控制无效果/超时/重播失败用)。
 struct MainTabView: View {
     var body: some View {
         TabView {
@@ -36,6 +36,8 @@ struct MainTabView: View {
                 .tabItem { Label("控制", systemImage: "camera.fill") }
             DashboardView()
                 .tabItem { Label("状态", systemImage: "gauge") }
+            ConsoleView()
+                .tabItem { Label("控制台", systemImage: "terminal") }
         }
     }
 }

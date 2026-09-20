@@ -58,17 +58,38 @@ actor NovatekClient {
         defer { gate.signal() }
         var request = try makeRequest(cmd: cmd, par: par, str: str)
         request.timeoutInterval = timeout
+        let start = CFAbsoluteTimeGetCurrent()
+        var params: [String] = []
+        if let par { params.append("par=\(par)") }
+        if let str { params.append("str=\(str)") }
+        let detail = params.isEmpty ? nil : params.joined(separator: ", ")
+        func record(ok: Bool, result: String) {
+            RequestConsole.shared.log(
+                kind: .command, title: "cmd=\(cmd)", detail: detail,
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: ok, result: result
+            )
+        }
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                record(ok: false, result: "HTTP \(code)")
                 throw NovatekError.badResponse("HTTP \(code)")
             }
-            return NovatekXMLParser.parse(data)
+            let reply = NovatekXMLParser.parse(data)
+            var summary: [String] = []
+            if let status = reply.response.status { summary.append("Status=\(status)") }
+            if let value = reply.response.value, !value.isEmpty { summary.append("Value=\(value)") }
+            if !reply.filePaths.isEmpty { summary.append("\(reply.filePaths.count) 个文件路径") }
+            record(ok: reply.response.status == nil || reply.response.status == 0,
+                result: summary.joined(separator: " "))
+            return reply
         } catch let error as NovatekError {
+            record(ok: false, result: error.localizedDescription)
             throw error
         } catch {
             // 读超时不重发: 命令可能已被设备执行, 重复执行有风险
+            record(ok: false, result: NovatekError.describe(error))
             throw NovatekError.transport(error.localizedDescription)
         }
     }
@@ -96,12 +117,22 @@ actor NovatekClient {
     func ping() async -> Bool {
         guard gate.tryWait() else { return true }
         defer { gate.signal() }
+        let start = CFAbsoluteTimeGetCurrent()
         do {
             var request = try makeRequest(cmd: 3016)
             request.timeoutInterval = 3
             _ = try await session.data(for: request)
+            RequestConsole.shared.log(
+                kind: .heartbeat, title: "cmd=3016",
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: true, result: "存活"
+            )
             return true
         } catch {
+            RequestConsole.shared.log(
+                kind: .heartbeat, title: "cmd=3016",
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: false,
+                result: NovatekError.describe(error)
+            )
             return false
         }
     }
@@ -143,10 +174,10 @@ actor NovatekClient {
         do {
             return try await fetchFilesDirect()
         } catch NovatekError.deviceStatus(-3) {
-            try? await send(3001, par: 2, timeout: 12)   // 切回放模式
-            try? await Task.sleep(for: .seconds(2))
+            _ = try? await send(3001, par: 2, timeout: 12)   // 切回放模式
+            _ = try? await Task.sleep(for: .seconds(2))
             let files = try await fetchFilesDirect()
-            try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (2026-09 实测: par=1=录像)
+            _ = try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (2026-09 实测: par=1=录像)
             return files
         }
     }
@@ -161,16 +192,17 @@ actor NovatekClient {
     /// 远程拍照 (2026-09-19 扫描台定稿: 本机录像中直接 1001 无效果, 只认"照片模式直拍"):
     /// ① 3001&par=0 切照片模式 (设备 3037 回报 4) → ② 1001 拍照 →
     /// ③ 3001&par=1 切回录像模式 → ④ 2001&par=1 恢复录像 (最后一步必须做);
+    /// 模式切换后不再盲等固定秒数, 轮询 3037 到位即走 (超时兜底放行), 拍照全程提速数秒;
     /// 中途出错仍尽力切回+恢复录像; 读超时 ≠ 失败 (可能已拍, 不可重发), 返回 nil 引导到相册确认。
     func capturePhoto() async throws -> String? {
         do {
             try await send(3001, par: 0, timeout: 12)    // 切照片模式 (3037=4)
-            try? await Task.sleep(for: .seconds(2))
+            await waitForMode(4, deadline: 4)
             let reply = try await request(cmd: 1001, timeout: 8)
             let path = reply.filePaths.first
             // 拍完无论成败都恢复行车状态 (切回录像模式 + 恢复循环录像)
-            try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (3037=1)
-            try? await Task.sleep(for: .seconds(1.5))
+            _ = try? await send(3001, par: 1, timeout: 12)   // 切回录像模式 (3037=1)
+            await waitForMode(1, deadline: 4)
             _ = try? await send(2001, par: 1, timeout: 15)   // 恢复录像 (本机只认 par=)
             guard reply.response.status == 0 else {
                 throw NovatekError.deviceStatus(reply.response.status ?? -1)
@@ -178,10 +210,23 @@ actor NovatekClient {
             return path
         } catch NovatekError.transport {
             // 已进入照片模式后失联: 尽力恢复, 照片可能已拍, 由用户到相册确认
-            try? await send(3001, par: 1, timeout: 12)
-            try? await Task.sleep(for: .seconds(1.5))
+            _ = try? await send(3001, par: 1, timeout: 12)
+            await waitForMode(1, deadline: 4)
             _ = try? await send(2001, par: 1, timeout: 15)
             return nil
+        }
+    }
+
+    /// 轮询设备当前工作模式 (3037 回报 Value): 到位即返回; 查询失败/超时则兜底放行
+    /// (等价于旧的固定 sleep, 但模式切换快时立即继续, 不白等)。只读命令可安全重复。
+    private func waitForMode(_ target: Int, deadline: TimeInterval) async {
+        let start = CFAbsoluteTimeGetCurrent()
+        while CFAbsoluteTimeGetCurrent() - start < deadline {
+            if let reply = try? await request(cmd: 3037, timeout: 3),
+               let value = reply.response.value.flatMap(Int.init), value == target {
+                return
+            }
+            _ = try? await Task.sleep(for: .milliseconds(300))
         }
     }
 
@@ -208,25 +253,45 @@ actor NovatekClient {
 
         await gate.wait(priority: .low)
         defer { gate.signal() }
+        let start = CFAbsoluteTimeGetCurrent()
         // bytes 流式读取: 首字节非 JPEG 魔数立即断开 (防服务器忽略参数回吐整段视频);
         // 超时沿用 session 配置的 8s request timeout
         guard let (bytes, response) = try? await session.bytes(from: thumbURL),
               let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            RequestConsole.shared.log(
+                kind: .download, title: "封面 4001 \(file.name)", detail: thumbURL.path,
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: false, result: "请求失败"
+            )
             return nil
         }
         var data = Data()
         data.reserveCapacity(64 * 1024)
         do {
             for try await byte in bytes {
-                if data.isEmpty && byte != 0xFF { return nil }   // 非 JPEG 开头 (如 TS 的 0x47) → 不支持
+                if data.isEmpty && byte != 0xFF {   // 非 JPEG 开头 (如 TS 的 0x47) → 不支持
+                    RequestConsole.shared.log(
+                        kind: .download, title: "封面 4001 \(file.name)", detail: thumbURL.path,
+                        duration: CFAbsoluteTimeGetCurrent() - start, ok: false, result: "固件不支持 (非图片响应)"
+                    )
+                    return nil
+                }
                 data.append(byte)
                 if data.count >= 512 * 1024 { break }
             }
         } catch {
+            RequestConsole.shared.log(
+                kind: .download, title: "封面 4001 \(file.name)", detail: thumbURL.path,
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: false,
+                result: NovatekError.describe(error)
+            )
             return nil
         }
         guard data.prefix(3) == Data([0xFF, 0xD8, 0xFF]) else { return nil }
         try? data.write(to: destination)
+        RequestConsole.shared.log(
+            kind: .download, title: "封面 4001 \(file.name)", detail: thumbURL.path,
+            duration: CFAbsoluteTimeGetCurrent() - start, ok: true, result: "\(data.count) 字节"
+        )
         return destination
     }
 
@@ -257,7 +322,7 @@ actor NovatekClient {
             // 超时 ≠ 失败: 只等设备恢复 (心跳), 绝不重发 2001, 防止请求风暴
             var waited: TimeInterval = 0
             while waited < 30 {
-                try? await Task.sleep(for: .seconds(2))
+                _ = try? await Task.sleep(for: .seconds(2))
                 waited += 2
                 if await ping() { return .sentUnconfirmed }
             }
@@ -322,9 +387,14 @@ actor NovatekClient {
         // 低优先级排队: 不挡住状态页/控制命令, 但仍与它们互斥串行
         await gate.wait(priority: .low)
         defer { gate.signal() }
+        let start = CFAbsoluteTimeGetCurrent()
         let (bytes, response) = try await session.bytes(from: remoteURL(of: file))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            RequestConsole.shared.log(
+                kind: .download, title: "取头部 \(file.name)", detail: remoteURL(of: file).path,
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: false, result: "HTTP \(code)"
+            )
             throw NovatekError.badResponse("下载失败 HTTP \(code)")
         }
         FileManager.default.createFile(atPath: destination.path, contents: nil)
@@ -346,11 +416,15 @@ actor NovatekClient {
         if !buffer.isEmpty {
             try handle.write(contentsOf: buffer)
         }
+        RequestConsole.shared.log(
+            kind: .download, title: "取头部 \(file.name)", detail: remoteURL(of: file).path,
+            duration: CFAbsoluteTimeGetCurrent() - start, ok: true, result: "\(received) 字节"
+        )
         return destination
     }
 
-    /// 设备上文件的 HTTP 地址 (hfs 文件服务器)
-    private func remoteURL(of file: DashcamFile) -> URL {
+    /// 设备上文件的 HTTP 地址 (hfs 文件服务器). 纯路径拼接, 不需要 actor 隔离
+    private nonisolated func remoteURL(of file: DashcamFile) -> URL {
         var url = baseURL
         for segment in file.downloadPath.split(separator: "/") {
             url.appendPathComponent(String(segment))
@@ -359,7 +433,7 @@ actor NovatekClient {
     }
 
     /// 相册在线播放用的流媒体地址 (FFmpeg 直接拉 HTTP-TS, 无需先下载)
-    func streamURL(for file: DashcamFile) -> URL {
+    nonisolated func streamURL(for file: DashcamFile) -> URL {
         remoteURL(of: file)
     }
 
@@ -367,14 +441,23 @@ actor NovatekClient {
     func fetchFileSize(for file: DashcamFile) async -> Int64? {
         await gate.wait()
         defer { gate.signal() }
+        let start = CFAbsoluteTimeGetCurrent()
         var request = URLRequest(url: remoteURL(of: file))
         request.httpMethod = "HEAD"
         request.timeoutInterval = 5
         guard let (_, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse,
               http.statusCode == 200, http.expectedContentLength >= 0 else {
+            RequestConsole.shared.log(
+                kind: .download, title: "HEAD \(file.name)", detail: remoteURL(of: file).path,
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: false, result: "获取大小失败"
+            )
             return nil
         }
+        RequestConsole.shared.log(
+            kind: .download, title: "HEAD \(file.name)", detail: remoteURL(of: file).path,
+            duration: CFAbsoluteTimeGetCurrent() - start, ok: true, result: "\(http.expectedContentLength) 字节"
+        )
         return http.expectedContentLength
     }
 
@@ -387,9 +470,14 @@ actor NovatekClient {
     ) async throws {
         await gate.wait(priority: .low)
         defer { gate.signal() }
+        let start = CFAbsoluteTimeGetCurrent()
         let (bytes, response) = try await session.bytes(from: remoteURL(of: file))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            RequestConsole.shared.log(
+                kind: .download, title: "下载 \(file.name)", detail: remoteURL(of: file).path,
+                duration: CFAbsoluteTimeGetCurrent() - start, ok: false, result: "HTTP \(code)"
+            )
             throw NovatekError.badResponse("下载失败 HTTP \(code)")
         }
 
@@ -401,18 +489,31 @@ actor NovatekClient {
         var received = 0.0
         var buffer = Data()
         buffer.reserveCapacity(64 * 1024)
-        for try await byte in bytes {
-            buffer.append(byte)
-            received += 1
-            if buffer.count >= 64 * 1024 {
-                try handle.write(contentsOf: buffer)
-                buffer.removeAll(keepingCapacity: true)
-                if total > 0 { progress(min(received / total, 1)) }
+        do {
+            for try await byte in bytes {
+                buffer.append(byte)
+                received += 1
+                if buffer.count >= 64 * 1024 {
+                    try handle.write(contentsOf: buffer)
+                    buffer.removeAll(keepingCapacity: true)
+                    if total > 0 { progress(min(received / total, 1)) }
+                }
             }
+        } catch {
+            RequestConsole.shared.log(
+                kind: .download, title: "下载 \(file.name)", detail: remoteURL(of: file).path,
+                duration: CFAbsoluteTimeGetCurrent() - start,
+                ok: false, result: "中断于 \(Int(received)) 字节: \(NovatekError.describe(error))"
+            )
+            throw error
         }
         if !buffer.isEmpty {
             try handle.write(contentsOf: buffer)
         }
         progress(1)
+        RequestConsole.shared.log(
+            kind: .download, title: "下载 \(file.name)", detail: remoteURL(of: file).path,
+            duration: CFAbsoluteTimeGetCurrent() - start, ok: true, result: "\(Int(received)) 字节"
+        )
     }
 }

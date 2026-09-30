@@ -14,6 +14,7 @@ final class AlbumModel {
 
     enum DownloadState {
         case running(Double)
+        case converting
         case done(URL)
         case failed(String)
     }
@@ -82,9 +83,28 @@ final class AlbumModel {
                     self?.downloads[file.id] = .running(progress)
                 }
             }
-            downloads[file.id] = .done(url)
+            downloads[file.id] = .done(try await convertToMP4IfTS(url, id: file.id))
         } catch {
             downloads[file.id] = .failed(NovatekError.describe(error))
+        }
+    }
+
+    /// 记录仪循环录像为 MPEG-TS 容器, iOS 相册/分享生态不认 → 下载完成后
+    /// 无转码重封装为 MP4 (画质无损, 速度接近拷贝); 失败降级保留原始 TS 供导出
+    private func convertToMP4IfTS(_ url: URL, id: String) async throws -> URL {
+        guard url.pathExtension.uppercased() == "TS" else { return url }
+        let mp4 = url.deletingPathExtension().appendingPathExtension("mp4")
+        downloads[id] = .converting
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try TSRemux.remuxToMP4(from: url, to: mp4)
+                // 成功后删掉中间 TS, 避免双份占空间 (mp4 已落盘, 删除失败不影响导出)
+                try? FileManager.default.removeItem(at: url)
+            }.value
+            return mp4
+        } catch {
+            toast = "MP4 转换失败, 已保留原始 TS"
+            return url
         }
     }
 
@@ -288,6 +308,10 @@ struct AlbumView: View {
 
         case .running(let progress):
             ProgressView(value: progress)
+                .frame(width: 44)
+
+        case .converting:
+            ProgressView()
                 .frame(width: 44)
 
         case .done(let url):

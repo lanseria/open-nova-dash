@@ -13,32 +13,25 @@ struct ContentView: View {
     @State private var connection = ConnectionModel()
 
     var body: some View {
-        Group {
+        // TabView 常驻: 未连接时只有"设备"(连接页), 本地相册不依赖设备连接、离线可看;
+        // 连接成功后"设备"展开为 控制/状态/控制台 三个功能页
+        TabView {
             if connection.isConnected {
-                MainTabView()
+                ControlView()
+                    .tabItem { Label("控制", systemImage: "camera.fill") }
+                DashboardView()
+                    .tabItem { Label("状态", systemImage: "gauge") }
+                ConsoleView()
+                    .tabItem { Label("控制台", systemImage: "terminal") }
             } else {
-                // 待连接 / 连接中 / 已断开: 一律停留在连接页面
                 ConnectView()
+                    .tabItem { Label("设备", systemImage: "antenna.radiowaves.left.and.right") }
             }
+            LocalLibraryView()
+                .tabItem { Label("本地相册", systemImage: "photo.stack") }
         }
         .environment(connection)
         .animation(.easeInOut(duration: 0.25), value: connection.state)
-    }
-}
-
-/// 连接成功后的三个功能页:
-/// ① 控制首页 (直播/录像/拍照 + 相册入口, 相册仅在停止录像后开放);
-/// ② 状态仪表盘; ③ 请求控制台 (排查控制无效果/超时/重播失败用)。
-struct MainTabView: View {
-    var body: some View {
-        TabView {
-            ControlView()
-                .tabItem { Label("控制", systemImage: "camera.fill") }
-            DashboardView()
-                .tabItem { Label("状态", systemImage: "gauge") }
-            ConsoleView()
-                .tabItem { Label("控制台", systemImage: "terminal") }
-        }
     }
 }
 

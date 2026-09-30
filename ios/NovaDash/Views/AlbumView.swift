@@ -6,6 +6,9 @@ import KSPlayer
 @MainActor
 @Observable
 final class AlbumModel {
+    /// 全局单例: 设备相册页与本地相册 tab 共享下载进度 (本地相册要展示"下载中")
+    static let shared = AlbumModel()
+
     enum Filter: String, CaseIterable {
         case all = "全部"
         case photo = "照片"
@@ -137,7 +140,8 @@ final class AlbumModel {
 }
 
 struct AlbumView: View {
-    @State private var model = AlbumModel()
+    /// @State 初始化为共享单例: 跨页面共享下载状态, 同时保留 $model 绑定 (筛选 Picker)
+    @State private var model = AlbumModel.shared
     @State private var viewerGroup: FileGroup?
     @State private var streamingFile: DashcamFile?
     /// 播放会话序号: 每次点开视频都换新身份, 保证 VideoStreamSheet 拿到全新播放器
